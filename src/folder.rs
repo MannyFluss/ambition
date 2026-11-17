@@ -9,11 +9,13 @@
 //!   thread.json     which thread is this folder's, and what it began with
 //!   state.json      what Ambition is doing now, for the language server
 //!   models.json     the models the engine offered when last asked
-//!   git/            the private history: a bare git repo whose work tree is
-//!                   the folder, so ^/undo works anywhere and your own repo is
-//!                   never touched
 //!   lock            one Ambition per folder
 //! ```
+//!
+//! The private history is a bare git repo whose work tree is the folder, so
+//! ^/undo works anywhere and your own repo is never touched. It lives outside
+//! the folder, in `~/.local/share/ambition/<folder>-<hash>.git`: inside it,
+//! editors took it for a repository of yours (Zed hung on it).
 //!
 //! Delete `.ambition/` and Ambition forgets the folder.
 
@@ -41,6 +43,8 @@ pub const MAX_BYTES: u64 = 512 * 1024;
 pub struct Folder {
     pub root: PathBuf,
     pub dot: PathBuf,
+    /// The private history (see above).
+    pub git_dir: PathBuf,
 }
 
 /// Commit subjects of the changes ^/undo may take back.
@@ -48,7 +52,10 @@ pub const UNDOABLE: [&str; 2] = ["Ambition: agent ", "Ambition: command "];
 
 impl Folder {
     pub fn new(root: &Path) -> Folder {
-        Folder { root: root.to_path_buf(), dot: root.join(DOT) }
+        let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "folder".into());
+        let hash = crate::util::sha(&root.to_string_lossy());
+        let git_dir = crate::util::data_dir().join(format!("{name}-{}.git", &hash[..8]));
+        Folder { root: root.to_path_buf(), dot: root.join(DOT), git_dir }
     }
 
     pub fn path(&self, rel: &str) -> PathBuf {
@@ -62,8 +69,22 @@ impl Folder {
         if !ignore.exists() {
             fs::write(&ignore, "# Ambition keeps this folder out of your own repo.\n*\n").map_err(|e| e.to_string())?;
         }
-        let git = self.dot.join("git");
+        let git = self.git_dir.clone();
+        // The first builds kept the history in .ambition/git: move it out.
+        let old = self.dot.join("git");
+        if old.join("HEAD").exists() && !git.join("HEAD").exists() {
+            if let Some(parent) = git.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if fs::rename(&old, &git).is_err() && copy_dir(&old, &git).is_ok() {
+                let _ = fs::remove_dir_all(&old);
+            }
+            self.git(&["config", "core.hooksPath", &git.join("no-hooks").to_string_lossy()]);
+        }
         if !git.join("HEAD").exists() {
+            if let Some(parent) = git.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
             let out = Command::new("git")
                 .args(["init", "--quiet", "--bare"])
                 .arg(&git)
@@ -101,7 +122,7 @@ impl Folder {
 
     pub fn git_in(&self, args: &[&str], input: Option<&[u8]>) -> Out {
         let mut c = Command::new("git");
-        c.arg(format!("--git-dir={}", self.dot.join("git").display()))
+        c.arg(format!("--git-dir={}", self.git_dir.display()))
             .arg(format!("--work-tree={}", self.root.display()))
             .args(args)
             .current_dir(&self.root)
@@ -365,6 +386,20 @@ pub fn unpatch(cur: &str, after: &str, before: &str) -> Option<String> {
         }
     }
     Some(c.join("\n"))
+}
+
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for e in fs::read_dir(from)? {
+        let e = e?;
+        let target = to.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            copy_dir(&e.path(), &target)?;
+        } else {
+            fs::copy(e.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 /// No NUL byte in the first 8 KB, and valid UTF-8 there.

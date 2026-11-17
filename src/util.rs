@@ -36,6 +36,16 @@ pub fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Where Ambition keeps what must not sit inside a watched folder:
+/// `$XDG_DATA_HOME/ambition`, else `~/.local/share/ambition`.
+pub fn data_dir() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home().join(".local").join("share"))
+        .join("ambition")
+}
+
 /// `~/notes` → `/Users/you/notes`.
 pub fn expand(p: &str) -> PathBuf {
     let p = p.trim();

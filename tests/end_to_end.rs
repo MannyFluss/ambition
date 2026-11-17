@@ -67,9 +67,12 @@ impl H {
         std::fs::read_to_string(self.dir.join(".ambition/history.md")).unwrap_or_default()
     }
 
-    /// The log of Ambition's own history.
+    /// The log of Ambition's own history, kept outside the folder.
     fn log(&self) -> String {
-        let args: Vec<String> = vec![format!("--git-dir={}", self.dir.join(".ambition/git").display()), "log".into(), "--format=%s".into()];
+        let store = self.root.join("home/.local/share/ambition");
+        let git = std::fs::read_dir(&store).ok().into_iter().flatten().flatten().map(|e| e.path())
+            .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("notes-"))).unwrap_or_default();
+        let args: Vec<String> = vec![format!("--git-dir={}", git.display()), "log".into(), "--format=%s".into()];
         String::from_utf8_lossy(&Command::new("git").args(&args).output().unwrap().stdout).to_string()
     }
 
@@ -440,6 +443,7 @@ fn ambition_only(h: &mut H) {
     let status = git(&h.dir, &["status", "--porcelain"]);
     h.check("the folder's own repo has only the user's commit", own.trim() == "the user's own commit", &own);
     h.check("the folder's own repo never sees .ambition/", !status.contains(".ambition"), &status);
+    h.check("no git repository sits inside the folder for an editor to find", !h.dir.join(".ambition/git").exists(), "");
     let log = h.log();
     h.check("the private history holds saves, turns, commands and undo",
         log.contains("Ambition: saved notes.md") && log.contains("Ambition: agent answered") && log.contains("Ambition: command /help")
