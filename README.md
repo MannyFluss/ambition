@@ -39,8 +39,8 @@ It needs two things beside it:
   web, other agents), and you can open the thread to read exactly what each
   save sent.
 
-It is tested on macOS. The same release builds it for Linux and Windows,
-but those have not been tried yet.
+It is used on macOS. Its tests pass on macOS and Linux on every push
+(against a fake T3); the Windows build compiles, but nobody has run it yet.
 
 ## Why it works this way
 
