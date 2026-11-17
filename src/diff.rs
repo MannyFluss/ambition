@@ -160,6 +160,26 @@ fn myers<T: PartialEq>(a: &[T], b: &[T]) -> Vec<(char, usize, usize)> {
     steps
 }
 
+/// Where an insertion point between lines (before line `pos` of `before`)
+/// moves to once the text has become `after`. Lines that were put back right
+/// at that point stay above it.
+pub fn remap(before: &str, after: &str, pos: usize) -> usize {
+    if before == after {
+        return pos;
+    }
+    let a: Vec<&str> = before.split('\n').collect();
+    let b: Vec<&str> = after.split('\n').collect();
+    for o in ops(&a, &b) {
+        if o.i1 == o.i2 {
+            continue; // an insertion right here: it stays above
+        }
+        if o.i1 <= pos && pos < o.i2 {
+            return if o.tag == Tag::Equal { o.j1 + (pos - o.i1) } else { o.j1 + (pos - o.i1).min(o.j2 - o.j1) };
+        }
+    }
+    b.len()
+}
+
 /// A unified diff of two texts' lines with `context` lines around each
 /// change, without the file headers: hunks start with `@@`.
 pub fn unified(a: &[&str], b: &[&str], context: usize) -> Vec<String> {
@@ -284,6 +304,19 @@ mod tests {
         let b = ["a", "b", "C", "d", "e", "f", "g", "h"];
         let u = unified(&a, &b, 1);
         assert_eq!(u, vec!["@@ -2,3 +2,3 @@", " b", "-c", "+C", " d", "@@ -7,1 +7,2 @@", " g", "+h"]);
+    }
+
+    #[test]
+    fn positions_follow_a_change() {
+        // A one-line paragraph grows back to three: what came after it moves down two.
+        let before = "# T\n\nshort.\n\nThe end.\n\n";
+        let after = "# T\n\nline one,\nline two,\nline three.\n\nThe end.\n\n";
+        assert_eq!(remap(before, after, 6), 8);
+        assert_eq!(remap(before, after, 4), 6);
+        assert_eq!(remap(before, after, 1), 1);
+        assert_eq!(remap(before, before, 3), 3);
+        // Lines put back exactly at the point stay above it.
+        assert_eq!(remap("a\nc", "a\nb\nc", 1), 2);
     }
 
     #[test]

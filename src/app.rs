@@ -568,6 +568,8 @@ impl App {
         // Take every caret line out, and note where each stood.
         let files: BTreeSet<String> = asks.iter().map(|a| a.rel.clone()).chain(cmds.keys().cloned()).collect();
         let mut at: BTreeMap<(String, usize), usize> = BTreeMap::new();
+        // Each file as it was once its carets were out: positions count from it.
+        let mut clean: BTreeMap<String, String> = BTreeMap::new();
         for rel in &files {
             let text = self.read(rel).unwrap_or_default();
             let mine: Vec<usize> = (0..asks.len()).filter(|&k| asks[k].rel == *rel).collect();
@@ -582,6 +584,7 @@ impl App {
                 at.insert((rel.clone(), c.line), pos[mine.len() + n]); // where its reply goes
             }
             self.write(rel, &stripped);
+            clean.insert(rel.clone(), stripped);
         }
         let names = files.iter().cloned().collect::<Vec<_>>().join(", ");
         let base = self.f.head();
@@ -593,14 +596,18 @@ impl App {
             .flat_map(|(r, cs)| cs.iter().map(|c| (r.clone(), c.clone(), at[&(r.clone(), c.line)])))
             .collect();
         order.sort_by_key(|(r, c, _)| (c.name != "undo", r.clone(), c.line));
-        let replies = self.do_commands(&order, false);
+        let replies = self.do_commands(&order, &clean, false);
 
-        // A status line where each prompt stood, and the commands' replies.
+        // A status line where each prompt stood, and the commands' replies. A
+        // command such as ^/undo may have changed the file: every position
+        // moves with the text it was next to.
         for rel in &files {
             let mut text = self.read(rel).unwrap_or_default();
+            let was = clean.get(rel).cloned().unwrap_or_default();
             let mut adds: Vec<(usize, u8, usize, Vec<String>)> = replies.get(rel).cloned().unwrap_or_default()
-                .into_iter().map(|(at, line, lines)| (at, 0, line, lines)).collect();
-            for a in asks.iter().filter(|a| a.rel == *rel) {
+                .into_iter().map(|(at, line, lines)| (diff::remap(&was, &text, at), 0, line, lines)).collect();
+            for a in asks.iter_mut().filter(|a| a.rel == *rel) {
+                a.pos = diff::remap(&was, &text, a.pos);
                 adds.push((a.pos, 2, a.p.start, vec![C::status_line(&a.p.lead, &a.id, &format!("{} · working", util::cut(&a.p.text, 48)))]));
             }
             adds.sort_by_key(|x| (x.0, x.1, x.2));
@@ -1350,11 +1357,14 @@ impl App {
     /// Run commands and return their replies by file: (line index for the
     /// reply, the command's own line, reply lines). Each comes with the index
     /// where it stood in the file once its caret lines were out.
-    fn do_commands(&self, order: &[(String, C::Command, usize)], during_run: bool) -> BTreeMap<String, Vec<(usize, usize, Vec<String>)>> {
+    fn do_commands(&self, order: &[(String, C::Command, usize)], base: &BTreeMap<String, String>, during_run: bool)
+        -> BTreeMap<String, Vec<(usize, usize, Vec<String>)>> {
         let mut out: BTreeMap<String, Vec<(usize, usize, Vec<String>)>> = BTreeMap::new();
         for (rel, c, pos) in order {
             let text = self.read(rel).unwrap_or_default();
-            let reply = self.run_command(c, rel, &Self::unit_above(rel, &text, *pos), during_run);
+            // An earlier command may have changed the file since the positions were taken.
+            let here = base.get(rel).map(|b| diff::remap(b, &text, *pos)).unwrap_or(*pos);
+            let reply = self.run_command(c, rel, &Self::unit_above(rel, &text, here), during_run);
             out.entry(rel.clone()).or_default().push((*pos, c.line, C::reply_lines(&c.lead, &reply, 12)));
             let line = format!("^/{} {}", c.name, c.args);
             self.f.history(&format!("## {} · {rel} · ^/{} · command\n{}\n{}", now(), c.name, line.trim_end(),
@@ -1378,9 +1388,11 @@ impl App {
             let (stripped, pos) = C::remove(&text, &ranges);
             self.write(&rel, &stripped);
             let order: Vec<(String, C::Command, usize)> = cmds.into_iter().zip(pos).map(|(c, p)| (rel.clone(), c, p)).collect();
-            let replies = self.do_commands(&order, true);
+            let base = BTreeMap::from([(rel.clone(), stripped.clone())]);
+            let replies = self.do_commands(&order, &base, true);
             let mut text = self.read(&rel).unwrap_or_default();
-            let mut adds = replies.get(&rel).cloned().unwrap_or_default();
+            let mut adds: Vec<(usize, usize, Vec<String>)> = replies.get(&rel).cloned().unwrap_or_default()
+                .into_iter().map(|(at, line, lines)| (diff::remap(&stripped, &text, at), line, lines)).collect();
             adds.sort_by_key(|x| (x.0, x.1));
             for (at, _, lines) in adds.into_iter().rev() {
                 text = C::insert(&text, at, &lines);

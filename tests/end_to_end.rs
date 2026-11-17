@@ -245,6 +245,17 @@ fn core(h: &mut H) {
     let undone = h.until("notes.md", 6.0, |t| !t.lines().any(|l| l == "hello") && t.contains("^> undid"));
     h.check("^/undo takes the agent's edit back", undone, h.note("notes.md"));
 
+    // Undo puts back a longer paragraph above the command: the reply still
+    // lands where ^/undo was written. (Found by using it in Zed.)
+    h.idle();
+    h.t3.next(edit("notes.md", "Line one of three,\nline two of three,\nline three of three.", "One line.", "Joined them."));
+    h.save("notes.md", "Line one of three,\nline two of three,\nline three of three.\n^ join these into one line\n\nThe end.\n");
+    h.until("notes.md", 10.0, |t| t.starts_with("One line.") && !t.contains('◌'));
+    h.idle();
+    h.save("notes.md", "One line.\n\nThe end.\n\n^/undo\n");
+    let placed = h.until("notes.md", 6.0, |t| t.contains("line three of three.\n\nThe end.\n\n^> undid"));
+    h.check("after ^/undo grows the text above, its reply stays where it was written", placed, h.note("notes.md"));
+
     // 5. A command written while the agent works is answered at once.
     h.idle();
     let (go_tx, go_rx) = mpsc::channel::<()>();
