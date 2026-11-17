@@ -5,7 +5,7 @@
     ^> and keeps a private git history so you can undo its changes.
 
 <p align="center">
-  <img src="media/demo.gif" width="760" alt="A note in Zed. A line that starts with ^ is saved; a status line with its words appears where it stood; the paragraph above is rewritten in place.">
+  <img src="media/demo.gif" width="760" alt="A note in Zed. Under a long paragraph, the line ^ make this shorter is typed and saved; the paragraphs around it light up, a status line counts the seconds, and the paragraph is rewritten in place. Then ^/undo is typed and saved, the original comes back, and a ^> line says what was undone.">
 </p>
 
 Ambition turns a folder into something you can talk to. There is no chat
@@ -100,9 +100,16 @@ server: `ambition lsp`.
 
 - **Zed**: `editors/zed/install.sh` adds the extension. Then turn on the two
   features it uses, which Zed keeps off by default, in the folder's
-  `.zed/settings.json`:
+  `.zed/settings.json`, and trust the folder when Zed asks: in Restricted
+  Mode it runs no language server. This is what the recording above used:
 
-      { "semantic_tokens": "combined", "inlay_hints": { "enabled": true } }
+      {
+        "semantic_tokens": "combined",
+        "inlay_hints": { "enabled": true },
+        "languages": {
+          "Markdown": { "semantic_tokens": "combined", "inlay_hints": { "enabled": true } }
+        }
+      }
 
 - **Neovim** (0.11 or later):
 
@@ -137,10 +144,13 @@ every time; above and below stays small as files grow.
 
 ## Inside
 
-- Everything Ambition keeps for a folder is in its `.ambition/`: your
-  commands, `history.md` (every prompt and reply), the agent's `notes.md`,
-  and the private history. A `.gitignore` inside keeps it out of your own
-  repo. Delete it, and Ambition forgets the folder.
+- What Ambition keeps for a folder is in its `.ambition/`: your commands,
+  `history.md` (every prompt and reply) and the agent's `notes.md`. A
+  `.gitignore` inside keeps it out of your own repo. Delete it, and Ambition
+  forgets the folder.
+- The private history that `^/undo` works from is a git repo kept outside
+  the folder, in `~/.local/share/ambition/<folder>-<hash>.git`, so no editor
+  takes it for a repository of yours.
 - One thread per folder, across files and days. A new one starts on
   `^/new`, when the rules change, or when the folder's own `AGENTS.md`
   changes, with a handoff from the one before.
