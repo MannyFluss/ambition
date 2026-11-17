@@ -1,0 +1,44 @@
+# On a tag like v0.1.0: build the one file for each system and attach it to
+# the release, named so that `$(uname -m)-$(uname -s)` finds it.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+  build:
+    needs: release
+    strategy:
+      matrix:
+        include:
+          - { os: macos-14, target: aarch64-apple-darwin, name: arm64-Darwin }
+          - { os: macos-14, target: x86_64-apple-darwin, name: x86_64-Darwin }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, name: x86_64-Linux }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: aarch64-Linux }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: x86_64-Windows }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: pack (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../ambition-${{ matrix.name }}.tar.gz ambition
+      - name: pack (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/ambition.exe -DestinationPath ambition-${{ matrix.name }}.zip
+      - run: gh release upload "$GITHUB_REF_NAME" ambition-${{ matrix.name }}.* --clobber
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
