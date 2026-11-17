@@ -1,0 +1,26 @@
+[package]
+name = "ambition"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "A document you talk to: write ^ at the start of a line, save, and the answer lands in the file."
+license = "MIT"
+repository = "https://github.com/MannyFluss/ambition"
+readme = "README.md"
+keywords = ["agent", "editor", "notes", "lsp", "t3"]
+categories = ["command-line-utilities", "text-editors"]
+exclude = ["editors/", "media/", ".github/"]
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+getrandom = "0.3"
+notify = "8"
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,11 @@
+id = "ambition"
+name = "Ambition"
+version = "0.1.0"
+schema_version = 1
+authors = ["MannyFluss"]
+description = "Colors, completion, hover and the run's state for Ambition's caret lines (^ prompts, ^/ commands, ^> replies)."
+repository = "https://github.com/MannyFluss/ambition"
+
+[language_servers.ambition]
+name = "Ambition"
+languages = ["Markdown", "Plain Text", "Python", "Shell Script", "JavaScript", "TypeScript", "TSX", "Rust", "TOML", "JSON", "YAML", "Lua", "Ruby", "Go", "C", "C++", "GDScript"]
