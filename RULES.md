@@ -14,8 +14,9 @@ line where it stood, with the prompt's words: `^ ◌ p3 · make this paragraph
 shorter · working`. A prompt of several lines gets one status line. When
 your turn ends, Ambition removes the status lines.
 
-Ambition sent you these rules as the first message of this thread. Its later
-messages each hold one save, and they begin with `[Ambition]`.
+Ambition's messages begin with `[Ambition]`. The first one in a thread holds
+these rules, what came before, and the first save; each later one holds one
+save.
 
 ## Where they are looking
 
