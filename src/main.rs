@@ -49,7 +49,7 @@ fn main() {
     if root == home || root.parent().is_none() {
         fail(2, "ambition: watch one folder, not your whole home or disk. Pick one inside it, like ~/notes.");
     }
-    if args.first().is_some() && !config.exists() {
+    if !args.is_empty() && !config.exists() {
         let _ = std::fs::create_dir_all(config.parent().unwrap());
         let _ = std::fs::write(&config, format!("{}\n", util::tilde(&root)));
     }

@@ -91,8 +91,7 @@ pub fn post(url: &str, body: &[u8], headers: &[(&str, &str)], timeout: Duration)
 
 fn dechunk(mut data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    loop {
-        let Some(eol) = data.windows(2).position(|w| w == b"\r\n") else { break };
+    while let Some(eol) = data.windows(2).position(|w| w == b"\r\n") {
         let size = String::from_utf8_lossy(&data[..eol]);
         let size = usize::from_str_radix(size.split(';').next().unwrap_or("").trim(), 16).unwrap_or(0);
         data = &data[eol + 2..];

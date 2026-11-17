@@ -67,9 +67,12 @@ pub struct S {
     n: u64,
 }
 
+/// The fake's state, shared by its connections, with a signal for "a run ended".
+pub type Shared = Arc<(Mutex<S>, Condvar)>;
+
 pub struct Fake {
     pub port: u16,
-    pub st: Arc<(Mutex<S>, Condvar)>,
+    pub st: Shared,
     pub home: PathBuf,
 }
 
@@ -78,7 +81,7 @@ impl Fake {
     pub fn start(home: &Path) -> Fake {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
-        let st: Arc<(Mutex<S>, Condvar)> = Arc::new((Mutex::new(S::default()), Condvar::new()));
+        let st: Shared = Arc::new((Mutex::new(S::default()), Condvar::new()));
         let s2 = st.clone();
         std::thread::spawn(move || {
             for c in l.incoming().flatten() {
@@ -125,7 +128,10 @@ impl Fake {
     }
 }
 
-fn read_request(c: &mut TcpStream) -> Option<(String, Vec<(String, String)>, String)> {
+/// A request: its path, its headers (names in lower case), and its body.
+type Request = (String, Vec<(String, String)>, String);
+
+fn read_request(c: &mut TcpStream) -> Option<Request> {
     let mut got = Vec::new();
     let mut buf = [0u8; 65536];
     loop {
@@ -182,7 +188,7 @@ fn answer(c: &mut TcpStream, status: &str, ctype: &str, extra: &[(&str, &str)], 
     let _ = c.write_all(&all);
 }
 
-fn serve(mut c: TcpStream, st: Arc<(Mutex<S>, Condvar)>) {
+fn serve(mut c: TcpStream, st: Shared) {
     let Some((path, headers, body)) = read_request(&mut c) else { return };
     if st.0.lock().unwrap().down {
         return; // T3 away: the connection just closes
@@ -260,7 +266,7 @@ fn providers(search: Option<&str>) -> Value {
     ]})
 }
 
-fn start_run(st: &Arc<(Mutex<S>, Condvar)>, tid: &str, message: &str) -> String {
+fn start_run(st: &Shared, tid: &str, message: &str) -> String {
     let (lock, cv) = &**st;
     let mut s = lock.lock().unwrap();
     s.n += 1;
@@ -293,7 +299,7 @@ fn start_run(st: &Arc<(Mutex<S>, Condvar)>, tid: &str, message: &str) -> String 
     run
 }
 
-fn tool(st: &Arc<(Mutex<S>, Condvar)>, name: &str, a: &Value) -> Result<Value, String> {
+fn tool(st: &Shared, name: &str, a: &Value) -> Result<Value, String> {
     st.0.lock().unwrap().calls.push(name.to_string());
     match name {
         "t3_project_list" => {

@@ -203,9 +203,12 @@ fn target(rel: &str, sc: &Scan, start: usize) -> Option<(usize, usize)> {
     C::above(rel, &sc.lines, start, &sc.caret)
 }
 
+/// 0-based (start, end) lines, end exclusive.
+type Span = (usize, usize);
+
 /// The text around a prompt's caret, as the agent is told of it: the
 /// paragraph (or last list item) just above, and the paragraph just below.
-fn around(rel: &str, sc: &Scan, p: &C::Prompt) -> (Option<(usize, usize)>, Option<(usize, usize)>) {
+fn around(rel: &str, sc: &Scan, p: &C::Prompt) -> (Option<Span>, Option<Span>) {
     (target(rel, sc, p.start), C::below(&sc.lines, p.end - 1, &sc.caret))
 }
 
@@ -237,11 +240,11 @@ fn where_(rel: &str, sc: &Scan, t: Option<(usize, usize)>) -> String {
 fn all_commands(root: &Path) -> BTreeMap<String, (String, String)> {
     let mut out: BTreeMap<String, (String, String)> = Cm::BUILTINS.iter().map(|(n, d)| (n.to_string(), (d.to_string(), "built in".to_string()))).collect();
     for (n, p) in Cm::find(root) {
-        if !out.contains_key(&n) {
+        out.entry(n).or_insert_with(|| {
             let d = Cm::describe(&p);
             let file = p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-            out.insert(n, (if d.is_empty() { file.clone() } else { d }, format!("runs .ambition/commands/{file}")));
-        }
+            (if d.is_empty() { file.clone() } else { d }, format!("runs .ambition/commands/{file}"))
+        });
     }
     out
 }
