@@ -55,7 +55,9 @@ your prompt.
 
 **Quiet.** Nothing runs until you save, and a save with no caret does
 nothing. Between saves Ambition sleeps until the operating system says a
-file changed. `^/` commands answer in code, with no model.
+file changed: watching a folder for eight minutes, through a setup and one
+answered prompt, it used 0.05 seconds of processor time and under 5 MB of
+memory. `^/` commands answer in code, with no model.
 
 **Nothing is final.** Ambition keeps a private git history of the folder,
 apart from your own repo, and `^/undo` takes back the agent's last turn. So
