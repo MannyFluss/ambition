@@ -7,7 +7,7 @@ use ambition::{t3::T3, util};
 use notify::{RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const USAGE: &str = "\
 Ambition: a document you talk to.
@@ -95,21 +95,27 @@ fn watch(root: &Path, app: Arc<App>) -> Box<dyn Watcher> {
     if let Err(e) = w.watch(root, RecursiveMode::Recursive) {
         fail(1, &format!("ambition: cannot watch {}: {e}", root.display()));
     }
+    // Reads are events too on Linux, and anything reading the folder (Ambition
+    // itself, an indexer, an editor) would otherwise keep a burst open forever.
+    // Only a change counts, and a burst ends 60 ms after its last change.
+    let change = |ev: notify::Result<notify::Event>| match ev {
+        Ok(ev) if !matches!(ev.kind, notify::EventKind::Access(_)) => Some(ev.paths),
+        _ => None,
+    };
     std::thread::spawn(move || {
-        while let Ok(first) = rx.recv() {
-            let mut paths = Vec::new();
-            let mut take = |ev: notify::Result<notify::Event>| {
-                // Reads are events too on some systems, and Ambition reads a file
-                // to see what changed: answering them would loop forever.
-                if let Ok(ev) = ev {
-                    if !matches!(ev.kind, notify::EventKind::Access(_)) {
-                        paths.extend(ev.paths);
+        while let Ok(ev) = rx.recv() {
+            let Some(mut paths) = change(ev) else { continue };
+            let mut end = Instant::now() + Duration::from_millis(60);
+            loop {
+                match rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
+                    Ok(ev) => {
+                        if let Some(more) = change(ev) {
+                            paths.extend(more);
+                            end = Instant::now() + Duration::from_millis(60);
+                        }
                     }
+                    Err(_) => break,
                 }
-            };
-            take(first);
-            while let Ok(ev) = rx.recv_timeout(Duration::from_millis(60)) {
-                take(ev);
             }
             paths.sort();
             paths.dedup();

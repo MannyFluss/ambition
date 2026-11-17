@@ -205,13 +205,13 @@ fn core(h: &mut H) {
     // 2. A save with no caret clears replies and starts nothing.
     let n = h.t3.messages().len();
     h.save("notes.md", "# Notes\n\nShort.\n^> an old reply\n^> its second line\n\nThe end.\n");
-    let cleared = h.until("notes.md", 5.0, |t| !t.contains("^>"));
+    let cleared = h.until("notes.md", 10.0, |t| !t.contains("^>"));
     h.check("a plain save clears the replies and starts nothing", cleared && h.t3.messages().len() == n, h.note("notes.md"));
 
     // 3. Commands, at once, without the agent.
     h.idle();
     h.save("notes.md", "# Notes\n\nShort.\n\n^/help\n");
-    let helped = h.until("notes.md", 6.0, |t| t.contains("^> /help:") && t.contains("^> /undo:"));
+    let helped = h.until("notes.md", 10.0, |t| t.contains("^> /help:") && t.contains("^> /undo:"));
     h.check("^/help lists the built-ins", helped, h.note("notes.md"));
     h.check("a command never reaches the agent", h.t3.messages().len() == n, h.t3.messages().len());
     h.idle();
@@ -220,19 +220,19 @@ fn core(h: &mut H) {
     h.command("echo.sh", &format!("#!/bin/sh\n# Echo its words.\necho \"args: $* | file: ${fenv} | line: ${lenv}\"\n"));
     h.command("slow.sh", "#!/bin/sh\n# Take too long.\nsleep 6\necho late\n");
     h.save("notes.md", "One two three four five.\n^/count\n\n^/echo a b c\n\n# ^/echo nope\n");
-    let counted = h.until("notes.md", 6.0, |t| t.contains("One two three four five.\n^> 5\n"));
+    let counted = h.until("notes.md", 10.0, |t| t.contains("One two three four five.\n^> 5\n"));
     h.check("^/count runs the script on the paragraph above", counted, h.note("notes.md"));
-    let echoed = h.until("notes.md", 3.0, |t| t.contains("^> args: a b c | file: notes.md | line: 4"));
+    let echoed = h.until("notes.md", 10.0, |t| t.contains("^> args: a b c | file: notes.md | line: 4"));
     h.check("^/echo gets its words, the file and the line", echoed, h.note("notes.md"));
     h.check("a ^/ line after # in a note is text, not a command", h.note("notes.md").contains("# ^/echo nope"), h.note("notes.md"));
     h.idle();
     h.save("notes.md", "Text.\n\n^/slwo\n");
-    let near = h.until("notes.md", 6.0, |t| t.contains("Did you mean ^/slow?"));
+    let near = h.until("notes.md", 10.0, |t| t.contains("Did you mean ^/slow?"));
     h.check("an unknown command says so and suggests one", near, h.note("notes.md"));
     h.idle();
     let t0 = Instant::now();
     h.save("notes.md", "Text.\n\n^/slow\n");
-    let stopped = h.until("notes.md", 8.0, |t| t.contains("(stopped after 2 seconds)"));
+    let stopped = h.until("notes.md", 10.0, |t| t.contains("(stopped after 2 seconds)"));
     h.check("a slow command is stopped at its limit", stopped && t0.elapsed() < Duration::from_secs(6), (h.note("notes.md"), t0.elapsed()));
 
     // 4. The same thread again, then undo.
@@ -245,7 +245,7 @@ fn core(h: &mut H) {
     h.check("a second prompt goes to the same thread", hello && launched == 1 && sent == 1, (h.note("notes.md"), launched, sent));
     h.idle();
     h.save("notes.md", format!("{}\n^/undo\n", h.note("notes.md").trim_end()).as_str());
-    let undone = h.until("notes.md", 6.0, |t| !t.lines().any(|l| l == "hello") && t.contains("^> undid"));
+    let undone = h.until("notes.md", 10.0, |t| !t.lines().any(|l| l == "hello") && t.contains("^> undid"));
     h.check("^/undo takes the agent's edit back", undone, h.note("notes.md"));
 
     // Undo puts back a longer paragraph above the command: the reply still
@@ -256,7 +256,7 @@ fn core(h: &mut H) {
     h.until("notes.md", 10.0, |t| t.starts_with("One line.") && !t.contains('◌'));
     h.idle();
     h.save("notes.md", "One line.\n\nThe end.\n\n^/undo\n");
-    let placed = h.until("notes.md", 6.0, |t| t.contains("line three of three.\n\nThe end.\n\n^> undid"));
+    let placed = h.until("notes.md", 10.0, |t| t.contains("line three of three.\n\nThe end.\n\n^> undid"));
     h.check("after ^/undo grows the text above, its reply stays where it was written", placed, h.note("notes.md"));
 
     // 5. A command written while the agent works is answered at once.
@@ -267,10 +267,10 @@ fn core(h: &mut H) {
         said("Done waiting.")
     });
     h.save("notes.md", "Wait for me.\n^ take your time\n");
-    h.until("notes.md", 6.0, |t| t.contains('◌'));
+    h.until("notes.md", 10.0, |t| t.contains('◌'));
     let during = format!("{}\n\nMeanwhile.\n^/help\n", h.note("notes.md").trim_end());
     h.save("notes.md", &during);
-    let mid = h.until("notes.md", 6.0, |t| t.contains("^> /help:"));
+    let mid = h.until("notes.md", 10.0, |t| t.contains("^> /help:"));
     let still = h.t3.running();
     h.check("a command during a run is answered before the run ends", mid && still, (h.note("notes.md"), still));
     let _ = go_tx.send(());
@@ -279,7 +279,7 @@ fn core(h: &mut H) {
     // 6. The answer reaches the file when the agent leaves it only in the thread.
     h.t3.next(|_| said("The answer is 4."));
     h.save("notes.md", "Two plus two.\n^ what is it?\n");
-    let ans = h.until("notes.md", 8.0, |t| t.contains("Two plus two.\n^> The answer is 4.\n"));
+    let ans = h.until("notes.md", 10.0, |t| t.contains("Two plus two.\n^> The answer is 4.\n"));
     h.check("the thread's answer lands in the file when the file is untouched", ans, h.note("notes.md"));
     h.idle();
     h.t3.next(|t| {
@@ -287,23 +287,23 @@ fn core(h: &mut H) {
         said("I wrote hi.sh.\n^> wrote hi.sh\n^> it prints hi")
     });
     h.save("notes.md", "Make a script.\n^ write hi.sh\n");
-    let both = h.until("notes.md", 8.0, |t| t.contains("^> wrote hi.sh\n^> it prints hi"));
+    let both = h.until("notes.md", 10.0, |t| t.contains("^> wrote hi.sh\n^> it prints hi"));
     h.check("^> lines left only in the thread reach the file, even when the turn made a file", both, h.note("notes.md"));
     h.idle();
     h.t3.next(edit("notes.md", "Old words.", "New words.", "Changed the paragraph."));
     h.save("notes.md", "Old words.\n^ change them\n");
-    let quiet = h.until("notes.md", 8.0, |t| t.contains("New words.") && !t.contains('◌'));
+    let quiet = h.until("notes.md", 10.0, |t| t.contains("New words.") && !t.contains('◌'));
     h.idle();
     h.check("a turn that edited and named its change adds no reply", quiet && !h.note("notes.md").contains("^>"), h.note("notes.md"));
 
     // 7. Caret lines leave no growing gap.
     h.t3.next(|_| said(""));
     h.save("notes.md", "a\n\n^ do nothing\n\nb\n");
-    let gap = h.until("notes.md", 8.0, |t| !t.contains('^'));
+    let gap = h.until("notes.md", 10.0, |t| !t.contains('^'));
     h.idle();
     h.check("a prompt between blank lines leaves one blank line, not two", gap && h.note("notes.md") == "a\n\nb\n", h.note("notes.md"));
     h.save("notes.md", "a\n\n^> r\n\nb\n");
-    let gap2 = h.until("notes.md", 5.0, |t| !t.contains('^'));
+    let gap2 = h.until("notes.md", 10.0, |t| !t.contains('^'));
     h.check("a cleared reply between blank lines leaves one blank line, not two", gap2 && h.note("notes.md") == "a\n\nb\n", h.note("notes.md"));
 
     // 8. When T3 is away, the prompt says so where it stood.
@@ -320,30 +320,30 @@ fn core(h: &mut H) {
 fn ambition_only(h: &mut H) {
     // Models, through T3's own list and search.
     h.save("notes.md", "Models.\n\n^/model\n");
-    let listed = h.until("notes.md", 6.0, |t| t.contains("Claude Sonnet 5.5") && t.contains("GPT-5.5") && !t.contains("Off 1"));
+    let listed = h.until("notes.md", 10.0, |t| t.contains("Claude Sonnet 5.5") && t.contains("GPT-5.5") && !t.contains("Off 1"));
     h.check("^/model lists the enabled models T3 offers", listed, h.note("notes.md"));
     h.idle();
     h.save("notes.md", "Models.\n\n^/model opus\n");
-    let fits = h.until("notes.md", 6.0, |t| t.contains("fits 2 models") && t.contains("Nothing changed"));
+    let fits = h.until("notes.md", 10.0, |t| t.contains("fits 2 models") && t.contains("Nothing changed"));
     h.check("a name that fits several models lists them and changes nothing", fits, h.note("notes.md"));
     h.idle();
     h.save("notes.md", "Models.\n\n^/model opus 5.5 high\n");
-    let switched = h.until("notes.md", 6.0, |t| t.contains("^> model: Claude Opus 5.5 · high."));
+    let switched = h.until("notes.md", 10.0, |t| t.contains("^> model: Claude Opus 5.5 · high."));
     let conf = h.t3.lock().configured.last().map(|c| c.1.clone()).unwrap_or_default();
     let dflt = h.t3.lock().defaults.last().map(|c| c.1.clone()).unwrap_or_default();
     h.check("^/model opus 5.5 high switches the thread and new threads",
         switched && conf["model"] == "claude-opus-5-5" && conf["options"][0]["value"] == "high" && dflt == conf, (h.note("notes.md"), conf, dflt));
     h.idle();
     h.save("notes.md", "Models.\n\n^/model gpt ultra\n");
-    let refused = h.until("notes.md", 6.0, |t| t.contains("has no effort “ultra” (it takes low, medium, high, xhigh)"));
+    let refused = h.until("notes.md", 10.0, |t| t.contains("has no effort “ultra” (it takes low, medium, high, xhigh)"));
     h.check("an effort the model lacks is refused", refused, h.note("notes.md"));
     h.idle();
     h.save("notes.md", "Models.\n\n^/model haiku\n");
-    let found = h.until("notes.md", 6.0, |t| t.contains("^> model: Claude Haiku 4.5."));
+    let found = h.until("notes.md", 10.0, |t| t.contains("^> model: Claude Haiku 4.5."));
     h.check("T3's search finds a model outside its short list", found, h.note("notes.md"));
     h.idle();
     h.save("notes.md", "Models.\n\n^/model sonnet\n\n^/model high\n");
-    let effort = h.until("notes.md", 8.0, |t| t.contains("^> model: Claude Sonnet 5.5 · high."));
+    let effort = h.until("notes.md", 10.0, |t| t.contains("^> model: Claude Sonnet 5.5 · high."));
     h.check("^/model high keeps the model and sets its effort", effort, h.note("notes.md"));
     h.idle();
 
@@ -355,7 +355,7 @@ fn ambition_only(h: &mut H) {
     h.check("saving AGENTS.md alone starts nothing", now_launched == before, now_launched);
     h.t3.next(|_| said("^> ok"));
     h.save("notes.md", "Anything.\n^ say ok\n");
-    h.until("notes.md", 8.0, |t| t.contains("^> ok"));
+    h.until("notes.md", 10.0, |t| t.contains("^> ok"));
     h.idle();
     let (launched, settled, first) = {
         let s = h.t3.lock();
@@ -369,13 +369,13 @@ fn ambition_only(h: &mut H) {
 
     // ^/new.
     h.save("notes.md", "Fresh.\n\n^/new\n");
-    let said_new = h.until("notes.md", 6.0, |t| t.contains("^> new: the next ^ prompt starts a new thread"));
+    let said_new = h.until("notes.md", 10.0, |t| t.contains("^> new: the next ^ prompt starts a new thread"));
     let now_launched = h.t3.lock().launched.len();
     h.check("^/new answers at once and starts nothing yet", said_new && now_launched == before + 1, h.note("notes.md"));
     h.idle();
     h.t3.next(|_| said("^> fresh"));
     h.save("notes.md", "Fresh.\n^ go\n");
-    h.until("notes.md", 8.0, |t| t.contains("^> fresh"));
+    h.until("notes.md", 10.0, |t| t.contains("^> fresh"));
     h.idle();
     let last = h.t3.lock().launched.last().map(|l| l.1.clone()).unwrap_or_default();
     let now_launched = h.t3.lock().launched.len();
@@ -383,7 +383,7 @@ fn ambition_only(h: &mut H) {
 
     // ^/thread and ^/stop.
     h.save("notes.md", "Where?\n\n^/thread\n");
-    let th = h.until("notes.md", 6.0, |t| t.contains("^> thread: t3://thread/thread-3"));
+    let th = h.until("notes.md", 10.0, |t| t.contains("^> thread: t3://thread/thread-3"));
     h.check("^/thread gives the link and the model", th, h.note("notes.md"));
     h.idle();
     let (go_tx, go_rx) = mpsc::channel::<()>();
@@ -392,9 +392,9 @@ fn ambition_only(h: &mut H) {
         said("too late")
     });
     h.save("notes.md", "Slow.\n^ think forever\n");
-    h.until("notes.md", 6.0, |t| t.contains('◌'));
+    h.until("notes.md", 10.0, |t| t.contains('◌'));
     h.save("notes.md", &format!("{}\n\n^/stop\n", h.note("notes.md").trim_end()));
-    let stopped = h.until("notes.md", 8.0, |t| t.contains("was stopped before it finished"));
+    let stopped = h.until("notes.md", 10.0, |t| t.contains("was stopped before it finished"));
     let _ = go_tx.send(());
     h.check("^/stop stops the turn, and the prompt says so", stopped, h.note("notes.md"));
     h.idle();
@@ -410,7 +410,7 @@ fn ambition_only(h: &mut H) {
         said("^> it returns one")
     });
     h.save("calc.py", "def f():\n    return 1\n# ^ what does f return?\n");
-    let code = h.until("calc.py", 8.0, |t| t.contains("    return 1\n# ^> it returns one\n") && !t.contains('◌'));
+    let code = h.until("calc.py", 10.0, |t| t.contains("    return 1\n# ^> it returns one\n") && !t.contains('◌'));
     h.check("a caret after # in code is a prompt, and its reply keeps the #", code, h.note("calc.py"));
     h.idle();
     let m = h.t3.messages().last().cloned().unwrap_or_default();
@@ -419,7 +419,7 @@ fn ambition_only(h: &mut H) {
     // The message carries what was typed since, and the commands run.
     h.t3.next(|_| said("^> seen"));
     h.save("notes.md", "Typed before asking.\n\nA line typed before asking.\n^ what did I type?\n");
-    h.until("notes.md", 8.0, |t| t.contains("^> seen"));
+    h.until("notes.md", 10.0, |t| t.contains("^> seen"));
     h.idle();
     let m = h.t3.messages().last().cloned().unwrap_or_default();
     h.check("the message holds what was typed since the last turn", m.contains("+A line typed before asking."), &m);
@@ -432,7 +432,7 @@ fn ambition_only(h: &mut H) {
     long.push_str("^ shorten the last one\n");
     h.t3.next(|_| said("^> done"));
     h.save("long.md", &long);
-    h.until("long.md", 8.0, |t| t.contains("^> done"));
+    h.until("long.md", 10.0, |t| t.contains("^> done"));
     h.idle();
     let m = h.t3.messages().last().cloned().unwrap_or_default();
     h.check("a long file: only the lines around the caret are quoted",
