@@ -1,168 +1,230 @@
-    ^ what is this?
-    ^> This is the README for Ambition, a tool that lets you talk to an AI
-    ^> through files in your editor. Write a line starting with `^` and save;
-    ^> the AI edits the file or answers there. It uses T3 Code to run the AI
-    ^> and keeps a private git history so you can undo its changes.
-
 <p align="center">
-  <img src="media/demo.gif" width="760" alt="A note in Zed. Under a long paragraph, the line ^ make this shorter is typed and saved; the paragraphs around it light up, a status line counts the seconds, and the paragraph is rewritten in place. Then ^/undo is typed and saved, the original comes back, and a ^> line says what was undone.">
+  <img src="media/demo.gif" width="760" alt="A note in Zed. Under a long paragraph, the line ^ make this shorter is typed, and control-option-return is pressed on it. The prompt becomes a status line with a timer, and the paragraph is rewritten in place. Then ^/undo is typed and pressed, the original paragraph comes back, and a ^> line says what was undone.">
 </p>
 
-Ambition turns a folder into something you can talk to. There is no chat
-box. In any file there, start a line with `^`, write what you want, and
-save. The answer lands in the file, or the file itself changes.
+# Ambition
+
+Write a line that starts with `^` in any file, press ⌃⌥↩ on it, and the
+answer lands in the file. There is no chat box: the document is the
+conversation. Behind it, each file has its own agent thread in
+[T3 Code](https://github.com/pingdotgg/t3code), with everything a T3 thread
+can do (a shell, the web, other agents).
 
 ## Three marks
 
-    ^ make this shorter     a prompt: your save sends it to the agent
+    ^ make this shorter     a prompt: a press on it sends it to the agent
     ^/undo                  a command: answered at once, in code, with no model
-    ^> the answer is 4      a reply: your next save clears it
+    ^> the answer is 4      a reply: your next press in that file clears it
 
 That is all the syntax there is.
 
+## A key, not a save
+
+Saving sends nothing. Only a press does: your editor's Ambition key saves
+the file and runs `ambition fire FILE:LINE`, and only the `^` line under
+the cursor is sent. A `^` line that arrives any other way (a `git pull`, a
+sync, another program) is text until you press on it.
+
+The first press in a folder asks first. On macOS a dialog offers Deny,
+Allow once and Always; elsewhere, run `ambition allow <folder>`. A folder is
+the file's git root, else the folder it is in, and one grant covers
+everything inside it. Your whole home folder or a disk is never granted.
+
 ## Get it
 
-One file, and one line of config.
+One file:
 
     curl -fsSL https://github.com/MannyFluss/ambition/releases/latest/download/ambition-$(uname -m)-$(uname -s).tar.gz | tar xz
-    ./ambition ~/notes
 
-The first run writes `~/notes` to `~/.config/ambition`, so from then on
-`ambition` alone is enough. Put the file anywhere on your PATH. With Rust:
-`cargo install --git https://github.com/MannyFluss/ambition`.
+Put `ambition` on your PATH and start it: `ambition`. It sleeps until a
+press reaches it, so it can stay running; on macOS a launchd job keeps it
+up (below). With Rust: `cargo install --git https://github.com/MannyFluss/ambition`.
 
 It needs two things beside it:
 
 - **git**, for the private history that makes undo work.
-- **[T3 Code](https://github.com/pingdotgg/t3code)**, open. Each folder's
-  agent is one T3 thread, with everything a T3 thread can do (a shell, the
-  web, other agents), and you can open the thread to read exactly what each
-  save sent.
+- **[T3 Code](https://github.com/pingdotgg/t3code)**, open. You can open any
+  file's thread there to read exactly what each press sent.
 
-It is used on macOS. Its tests pass on macOS and Linux on every push
-(against a fake T3); the Windows build compiles, but nobody has run it yet.
+Then bind the key in your editor.
 
-## Why it works this way
+## In your editor
 
-**Your attention is the scarce thing.** The caret marks where you are
-looking, and that is all the context you give. Ambition sends the agent
-your words, the text just above and below the caret, and what you changed
-since its last turn.
+**Zed** (tried on 1.28). Add the task in
+[`editors/zed/tasks.json`](editors/zed/tasks.json) to
+`~/.config/zed/tasks.json` and the binding in
+[`editors/zed/keymap.json`](editors/zed/keymap.json) to
+`~/.config/zed/keymap.json`. The task saves the file first, and its terminal
+stays out of sight. If a press seems to do nothing, open the terminal panel
+(⌃\`): its tab "Ambition: press" says why. Zed runs tasks in your login
+shell, so `ambition` must be on that shell's PATH.
 
-**The document is the interface.** There is no window to switch to. The
-answer lands where you were looking: as an edit, or as `^>` lines under
-your prompt.
+For colors, completion, and a hover that says what a press will send,
+`editors/zed/install.sh` adds the extension. Turn on the two features it
+uses, which Zed keeps off by default, and trust the folder when Zed asks (in
+Restricted Mode it runs no language server):
 
-**Quiet.** Nothing runs until you save, and a save with no caret does
-nothing. Between saves Ambition sleeps until the operating system says a
-file changed: watching a folder for eight minutes, through a setup and one
-answered prompt, it used 0.05 seconds of processor time and under 5 MB of
-memory. `^/` commands answer in code, with no model.
+    {
+      "semantic_tokens": "combined",
+      "inlay_hints": { "enabled": true },
+      "languages": {
+        "Markdown": { "semantic_tokens": "combined", "inlay_hints": { "enabled": true } }
+      }
+    }
 
-**Nothing is final.** Ambition keeps a private git history of the folder,
-apart from your own repo, and `^/undo` takes back the agent's last turn. So
-the agent acts instead of asking for permission.
+**Neovim** (0.10 or later): put [`editors/nvim/ambition.lua`](editors/nvim/ambition.lua)
+in `~/.config/nvim/plugin/`. It binds ⌃⌥↩ (`<C-M-CR>`), adds
+`:AmbitionPress`, and starts the language server. A terminal Neovim sees
+⌃⌥↩ only if the terminal sends it; the file says what to do if not.
 
-**Show, don't claim.** What the agent is told is one file you can read,
-[RULES.md](RULES.md), exactly as every thread receives it. How it reads the
-caret was settled by an experiment you can rerun
-([below](#how-it-reads-the-caret)). And the thread shows every message it
-was sent.
+**Anything else**: bind a key that saves, then runs `ambition fire
+FILE:LINE` with the cursor's line. For the language server, start `ambition
+lsp`. Only Zed and Neovim have been tried.
 
-## Ten saves
+## What a press sends
 
-[TUTORIAL.md](TUTORIAL.md) is a file you play in: a command, a first
-prompt, undo, a table filled from above it, one long memory, the models,
-your own command, a script it writes and runs. Drop it into your folder:
+The agent gets what Ambition calls the hook: where you are (the file's
+path), your `^` line, the 8 lines above and below it as they are on disk,
+and what changed in the file since that file's last turn. Nothing else is
+attached. When the agent needs more, it runs `ambition more up` or
+`ambition more down`, with a number of lines it chooses, and reads further
+from where the hook stopped. What the agent is told is one file you can
+read, [RULES.md](RULES.md), exactly as each thread receives it.
 
-    curl -fsSLo ~/notes/tutorial.md https://raw.githubusercontent.com/MannyFluss/ambition/main/TUTORIAL.md
+That was chosen by [examples/context.rs](examples/context.rs), 16 prompts
+whose right answers are known (a table under the caret, a section under a
+heading, a sentence between two paragraphs, a question inside a function, an
+entry 140 lines from the one to copy), each in a fresh T3 thread, twice per
+model:
+
+|                                          | Claude Sonnet 5.5 | Claude Haiku 5.5 | a turn, Haiku |
+|------------------------------------------|-------------------|------------------|---------------|
+| the paragraph above                      | 32 of 32          | 31 of 32         | 9.7 s         |
+| above and below                          | 32 of 32          | 32 of 32         | 10.8 s        |
+| file and line only                       | 32 of 32          | 32 of 32         | 17.7 s        |
+| the whole file                           | 32 of 32          | 32 of 32         | 10.3 s        |
+| **8 lines each way, and `ambition more`** | **32 of 32**     | **32 of 32**     | **12.4 s**    |
+
+The first four rows are Ambition 0.1, on 2026-11-16, which sent on save;
+the code for them is at tag v0.1.0. The paragraph above missed the one
+prompt that asks for a sentence between two paragraphs, and file and line
+alone was slowest because the agent read the file first. The last row is
+this release, on 2026-11-18, through the real press: its time runs from the
+press to the status line going, so it includes Ambition's own commits and
+T3 starting a thread, which 0.1's rows did not. (Sonnet 5.5's median that
+day was 5.9 s.) The agents asked for more in 3 of 64 runs, all to summarize
+a long section below the caret; for the entry 140 lines away they used
+their own tools on the file. The hook stays the same size however long the
+file grows.
+
+## Threads
+
+- **One per file.** Each file's thread goes on across presses and days,
+  and T3 groups a folder's threads under one project. `^/thread` gives the
+  link; `^/new` starts a fresh one with a handoff.
+- **One turn at a time per folder.** A press while another turn runs in the
+  same folder waits in line, and its status line says `waiting for p2`.
+  Other folders run side by side. Commands run at once, except `^/undo`,
+  which asks you to press it again when the turn ends.
+- **The coordinator.** One more thread knows the others. A thread reaches it
+  with `ambition ask coordinator "…"` and gets its answer back; you talk to
+  it in `~/.ambition/coordinator.md`, with `^` lines like anywhere else. It
+  can read the list of threads and any thread's history, and pass messages
+  on. It cannot stop or start threads.
 
 ## Commands
 
     ^/help                  the commands, with what each does
     ^/model                 the models T3 offers, the one in use marked
-    ^/model opus high       switch the thread's model (and effort), by T3's own search
-    ^/new                   the next prompt starts a new thread, with a handoff
-    ^/thread                the link to this folder's thread in T3
-    ^/stop                  stop the turn that is running
-    ^/undo                  take back Ambition's last change
+    ^/model opus high       switch this file's thread (and effort); new threads start on it
+    ^/new                   this file's next prompt starts a new thread, with a handoff
+    ^/thread                the link to this file's thread
+    ^/stop                  stop the turn running in this folder
+    ^/undo                  take back Ambition's last change in this folder
 
-Your own commands are scripts in `.ambition/commands/`, one file each:
-`count.sh` answers `^/count`. The paragraph above the command arrives on
-stdin, and what the script prints becomes the reply. Ask for one in plain
-words, and the agent writes it there.
+Your own commands are scripts in `~/.ambition/commands/`, one file each,
+for every folder: `count.sh` answers `^/count`. The paragraph above the
+command arrives on stdin, and what the script prints becomes the reply. Ask
+for one in plain words, and the agent writes it there.
 
-## In your editor
+## Why it works this way
 
-Ambition only watches files, so any editor works. For colors, completion,
-and a hover that shows what a prompt will send, it also has a language
-server: `ambition lsp`.
+**Your attention is the scarce thing.** The caret marks where you are
+looking, and that is all the context you give. The hook is small and the
+same every time; the agent reads further only when it needs to.
 
-- **Zed**: `editors/zed/install.sh` adds the extension. Then turn on the two
-  features it uses, which Zed keeps off by default, in the folder's
-  `.zed/settings.json`, and trust the folder when Zed asks: in Restricted
-  Mode it runs no language server. This is what the recording above used:
+**A press means you were there.** Nothing fires because a file changed, so
+nothing another program writes can start an agent with a shell. Running
+`ambition fire` takes code already running as you, and even then only the
+line it names is sent.
 
-      {
-        "semantic_tokens": "combined",
-        "inlay_hints": { "enabled": true },
-        "languages": {
-          "Markdown": { "semantic_tokens": "combined", "inlay_hints": { "enabled": true } }
-        }
-      }
+**The document is the interface.** The answer lands where you were
+looking: as an edit, or as `^>` lines under your prompt.
 
-- **Neovim** (0.11 or later):
+**Quiet.** There is no file watcher. Between presses Ambition sleeps on its
+inbox, a socket only you can reach; `^/` commands answer in code, with no
+model.
 
-      vim.lsp.config('ambition', { cmd = { 'ambition', 'lsp' }, root_markers = { '.ambition' },
-        filetypes = { 'markdown', 'text', 'python', 'javascript', 'rust' } })
-      vim.lsp.enable('ambition')
+**Nothing is final.** Ambition keeps a private git history of each folder,
+apart from your own repo, and `^/undo` takes back the agent's last turn. So
+the agent acts instead of asking for permission.
 
-- Any other editor that speaks LSP: start `ambition lsp`. Only Zed and
-  Neovim have been tried.
+**Show, don't claim.** The rules are one file, the hook was chosen by an
+experiment you can rerun, and each thread shows every message it was sent.
+The screenshots in [proof/](proof/) come from driving the real Zed.
 
-## How it reads the caret
+## Everything it keeps
 
-The agent is told the file and line of each prompt, the paragraphs just
-above and below its caret, and the file around it. That was chosen by
-[examples/context.rs](examples/context.rs), which ran 16 prompts whose right
-answers are known (a table under the caret, a section under a heading, a
-sentence between two paragraphs, a question inside a function, an entry 140
-lines from the one to copy) through real T3 threads, four ways, twice each:
+All of it is in `~/.ambition/` (or `$AMBITION_HOME`). Nothing is kept in
+your folders; the agents still edit your files.
 
-|                         | Claude Sonnet 5.5 | Claude Haiku 5.5 | a turn, Haiku |
-|-------------------------|-------------------|------------------|---------------|
-| the paragraph above     | 32 of 32          | 31 of 32         | 9.7 s         |
-| **above and below**     | 32 of 32          | 32 of 32         | 10.8 s        |
-| file and line only      | 32 of 32          | 32 of 32         | 17.7 s        |
-| the whole file          | 32 of 32          | 32 of 32         | 10.3 s        |
+    config            your settings: `allow = <folder>`, one line per grant
+    threads           each file's thread: its folder, link, model, last turn
+    state.json        the presses on their way now, for the language server
+    models.json       the models T3 offered when last asked, and the one chosen last
+    commands/         your own ^/ commands
+    notes.md          what threads keep for later threads
+    AGENTS.md         optional: every thread reads it
+    coordinator.md    where you talk to the coordinator
+    history/          per folder: its private git history (<folder>-<hash>.git)
+                      and the record of every prompt and reply (<folder>-<hash>.md)
+    inbox, lock       where the running Ambition listens, and one at a time
 
-The paragraph above, which is how it first worked, missed the one prompt
-that asks for a sentence between two paragraphs: it added the sentence to a
-paragraph instead. File and line alone is slowest, because the agent reads
-the file first. The whole file does as well, but it sends all of a file
-every time; above and below stays small as files grow.
+A thread also reads the `AGENTS.md` files on the way from its folder down
+to its file. A new thread starts when one of them changes, or the rules do,
+with a handoff from the thread before.
+
+To keep it running on macOS, a launchd job at
+`~/Library/LaunchAgents/com.you.ambition.plist`, loaded once with `launchctl
+load` on that file:
+
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0"><dict>
+      <key>Label</key><string>com.you.ambition</string>
+      <key>ProgramArguments</key><array><string>/usr/local/bin/ambition</string></array>
+      <key>RunAtLoad</key><true/>
+      <key>KeepAlive</key><true/>
+    </dict></plist>
 
 ## Inside
 
-- What Ambition keeps for a folder is in its `.ambition/`: your commands,
-  `history.md` (every prompt and reply) and the agent's `notes.md`. A
-  `.gitignore` inside keeps it out of your own repo. Delete it, and Ambition
-  forgets the folder.
-- The private history that `^/undo` works from is a git repo kept outside
-  the folder, in `~/.local/share/ambition/<folder>-<hash>.git`, so no editor
-  takes it for a repository of yours.
-- One thread per folder, across files and days. A new one starts on
-  `^/new`, when the rules change, or when the folder's own `AGENTS.md`
-  changes, with a handoff from the one before.
+- One inbox, one door: `ambition fire`, and the agent's `ambition more` and
+  `ambition ask`, all post a line of JSON to it ([src/inbox.rs](src/inbox.rs)).
+  A global hotkey can post there the same way.
 - The engine is T3 Code, behind one small trait
   ([src/engine.rs](src/engine.rs)). Another engine is one more `impl`.
-- `cargo test` runs the real binary against a fake T3, save by save.
+- `cargo test` runs the real binary against a fake T3, press by press, with
+  a stand-in for the macOS dialog. CI runs it on macOS and Linux on every
+  push. This release was used on macOS; it compiles for Linux and Windows,
+  but nobody has used it there yet.
 
-## Where it could go
+## Where it is going
 
-The caret could live in every text field on a computer, not only in a
-folder's files. That needs a permission over the whole machine, so it is
-not here. It is yours to try.
+The same key in every text field on a Mac (a browser's, Notes'), with a
+field's text kept like a file so that undo and "what changed" work the same.
+That needs Accessibility and Screen Recording grants, so it comes as its own
+release, 0.3.
 
 ---
 
