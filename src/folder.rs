@@ -1,23 +1,15 @@
-//! The folder Ambition watches, and the one hidden folder it keeps there.
+//! A folder with presses in it, and what Ambition keeps for it, outside it.
 //!
 //! ```text
-//! <folder>/.ambition/
-//!   .gitignore      "*": keeps all of this out of the folder's own repo
-//!   history.md      every prompt, command and reply, newest last
-//!   notes.md        the agent's notes for later threads (the agent writes it)
-//!   commands/       your own ^/ commands, one file each
-//!   thread.json     which thread is this folder's, and what it began with
-//!   state.json      what Ambition is doing now, for the language server
-//!   models.json     the models the engine offered when last asked
-//!   lock            one Ambition per folder
+//! ~/.ambition/history/<folder>-<hash>.git   the private history: a bare git
+//!                                           repo whose work tree is the folder
+//! ~/.ambition/history/<folder>-<hash>.md    every prompt, command and reply
 //! ```
 //!
-//! The private history is a bare git repo whose work tree is the folder, so
-//! ^/undo works anywhere and your own repo is never touched. It lives outside
-//! the folder, in `~/.local/share/ambition/<folder>-<hash>.git`: inside it,
-//! editors took it for a repository of yours (Zed hung on it).
-//!
-//! Delete `.ambition/` and Ambition forgets the folder.
+//! `^/undo` works from the private history, so your own repo is never
+//! touched. It stays outside the folder: inside, editors took it for a
+//! repository of yours (Zed hung on it). Ambition writes nothing in the
+//! folder but the answers.
 
 use crate::{carets as C, diff};
 use std::collections::BTreeMap;
@@ -33,18 +25,18 @@ pub struct Out {
     pub stderr: Vec<u8>,
 }
 
-pub const DOT: &str = ".ambition";
-pub const HISTORY: &str = ".ambition/history.md";
-pub const NOTES: &str = ".ambition/notes.md";
-pub const COMMANDS: &str = ".ambition/commands";
 /// A bigger file is never read for carets.
 pub const MAX_BYTES: u64 = 512 * 1024;
 
+/// Ambition's own files in its own folder, kept out of that folder's history.
+const OWN: &str = "/history/\n/state.json\n/threads\n/models.json\n/inbox\n/config\n/lock\n/*.tmp*\n";
+
 pub struct Folder {
     pub root: PathBuf,
-    pub dot: PathBuf,
     /// The private history (see above).
     pub git_dir: PathBuf,
+    /// The record of every prompt, command and reply here.
+    pub log: PathBuf,
 }
 
 /// Commit subjects of the changes ^/undo may take back.
@@ -53,34 +45,25 @@ pub const UNDOABLE: [&str; 2] = ["Ambition: agent ", "Ambition: command "];
 impl Folder {
     pub fn new(root: &Path) -> Folder {
         let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "folder".into());
+        let name = name.trim_start_matches('.').to_string();
         let hash = crate::util::sha(&root.to_string_lossy());
-        let git_dir = crate::util::data_dir().join(format!("{name}-{}.git", &hash[..8]));
-        Folder { root: root.to_path_buf(), dot: root.join(DOT), git_dir }
+        let base = crate::util::state_dir().join("history").join(format!("{name}-{}", &hash[..8]));
+        Folder { root: root.to_path_buf(), git_dir: base.with_extension("git"), log: base.with_extension("md") }
+    }
+
+    /// A path relative to the folder, with `/`.
+    pub fn rel(&self, p: &Path) -> Option<String> {
+        let r = p.strip_prefix(&self.root).ok()?.to_string_lossy().replace('\\', "/");
+        (!r.is_empty()).then_some(r)
     }
 
     pub fn path(&self, rel: &str) -> PathBuf {
         self.root.join(rel)
     }
 
-    /// Make `.ambition/` and its private history, if they are not there yet.
+    /// Make the private history, if it is not there yet.
     pub fn init(&self) -> Result<(), String> {
-        fs::create_dir_all(&self.dot).map_err(|e| format!("cannot make {}: {e}", self.dot.display()))?;
-        let ignore = self.dot.join(".gitignore");
-        if !ignore.exists() {
-            fs::write(&ignore, "# Ambition keeps this folder out of your own repo.\n*\n").map_err(|e| e.to_string())?;
-        }
         let git = self.git_dir.clone();
-        // The first builds kept the history in .ambition/git: move it out.
-        let old = self.dot.join("git");
-        if old.join("HEAD").exists() && !git.join("HEAD").exists() {
-            if let Some(parent) = git.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            if fs::rename(&old, &git).is_err() && copy_dir(&old, &git).is_ok() {
-                let _ = fs::remove_dir_all(&old);
-            }
-            self.git(&["config", "core.hooksPath", &git.join("no-hooks").to_string_lossy()]);
-        }
         if !git.join("HEAD").exists() {
             if let Some(parent) = git.parent() {
                 let _ = fs::create_dir_all(parent);
@@ -93,8 +76,10 @@ impl Folder {
             if !out.status.success() {
                 return Err(format!("git init failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
             }
+            let own = crate::util::state_real();
+            let exclude = if self.root == own { OWN } else { "" };
             let _ = fs::create_dir_all(git.join("info"));
-            let _ = fs::write(git.join("info").join("exclude"), "/.ambition/\n");
+            let _ = fs::write(git.join("info").join("exclude"), format!("/.ambition/\n{exclude}"));
             for (k, v) in [
                 ("user.name", "Ambition"),
                 ("user.email", "ambition@localhost"),
@@ -110,7 +95,7 @@ impl Folder {
             self.git(&["config", "core.hooksPath", &nohooks.to_string_lossy()]);
         }
         if self.git(&["rev-parse", "--verify", "-q", "HEAD"]).stdout.is_empty() {
-            self.commit("Ambition: started watching this folder");
+            self.commit("Ambition: the first press in this folder");
         }
         Ok(())
     }
@@ -192,14 +177,17 @@ impl Folder {
         fs::write(p, text).is_ok()
     }
 
-    /// Append an entry to `.ambition/history.md`.
+    /// Append an entry to the folder's log.
     pub fn history(&self, entry: &str) {
-        let p = self.path(HISTORY);
-        let _ = fs::create_dir_all(&self.dot);
-        if !p.exists() {
-            let _ = fs::write(&p, "# Ambition history\n\nEvery caret prompt and command, what handled it, and the replies, newest last.\n");
+        let p = &self.log;
+        if let Some(d) = p.parent() {
+            let _ = fs::create_dir_all(d);
         }
-        if let Ok(mut f) = fs::OpenOptions::new().append(true).open(&p) {
+        if !p.exists() {
+            let _ = fs::write(p, format!("# Ambition history for {}\n\nEvery prompt, command and reply, newest last.\n",
+                crate::util::tilde(&self.root)));
+        }
+        if let Ok(mut f) = fs::OpenOptions::new().append(true).open(p) {
             let _ = write!(f, "\n{}\n", entry.trim_end_matches('\n'));
         }
     }
@@ -210,14 +198,7 @@ impl Folder {
         self.git(&["add", "--update", "--", "."]);
         let tracked: std::collections::BTreeSet<String> =
             self.git_text(&["ls-files", "-z"]).split('\0').map(str::to_string).collect();
-        let mut new: Vec<String> = self.files().into_iter().filter(|f| !tracked.contains(f)).collect();
-        // Your commands and the agent's notes sit inside .ambition/, which its own
-        // .gitignore hides, so they are added by name.
-        for extra in [COMMANDS, NOTES] {
-            if self.path(extra).exists() {
-                new.push(extra.to_string());
-            }
-        }
+        let new: Vec<String> = self.files().into_iter().filter(|f| !tracked.contains(f)).collect();
         if !new.is_empty() {
             let list = new.join("\0");
             self.git_in(&["add", "--force", "--pathspec-from-file=-", "--pathspec-file-nul"], Some(list.as_bytes()));
@@ -290,15 +271,13 @@ impl Folder {
     }
 
     /// What undoing commit `h` does to the files now: {rel: new text, or None
-    /// to delete}, or why it cannot. Reply lines are left out of the
-    /// comparison, since a save clears them anyway.
+    /// to delete}, or why it cannot. Reply and status lines are left out of
+    /// the comparison: a press clears replies anyway, and status lines are
+    /// Ambition's own.
     pub fn reverse(&self, h: &str) -> Result<BTreeMap<String, Option<String>>, String> {
         let mut out = BTreeMap::new();
         for (_, rel) in self.changed_in(h) {
-            if rel == HISTORY {
-                continue;
-            }
-            let clear = |t: Option<String>| t.map(|t| C::clear_replies(&rel, &t, false).0);
+            let clear = |t: Option<String>| t.map(|t| C::clear_marks(&rel, &t));
             let before = clear(self.show(&format!("{h}^"), &rel));
             let after = clear(self.show(h, &rel));
             let cur = self.read(&rel);
@@ -309,7 +288,7 @@ impl Folder {
                 (None, Some(after)) => {
                     // The change made this file.
                     if let Some(c) = &cur {
-                        if C::clear_replies(&rel, c, false).0 != after {
+                        if C::clear_marks(&rel, c) != after {
                             return Err(format!("{rel} has changed since that run made it"));
                         }
                     }
@@ -386,20 +365,6 @@ pub fn unpatch(cur: &str, after: &str, before: &str) -> Option<String> {
         }
     }
     Some(c.join("\n"))
-}
-
-fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(to)?;
-    for e in fs::read_dir(from)? {
-        let e = e?;
-        let target = to.join(e.file_name());
-        if e.file_type()?.is_dir() {
-            copy_dir(&e.path(), &target)?;
-        } else {
-            fs::copy(e.path(), target)?;
-        }
-    }
-    Ok(())
 }
 
 /// No NUL byte in the first 8 KB, and valid UTF-8 there.

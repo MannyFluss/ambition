@@ -1,4 +1,4 @@
-//! T3 Code as Ambition's engine: one thread per folder, with T3's whole kit.
+//! T3 Code as Ambition's engine: one thread per document, with T3's whole kit.
 //!
 //! Ambition signs in to the T3 server running on this machine the way an
 //! outside agent does, then calls the same tools a T3 thread calls, over
@@ -6,7 +6,7 @@
 //!
 //! - Sign-in: `t3 auth pairing create` mints a one-time code, and T3's MCP
 //!   OAuth endpoints trade it for a full-access token. The token lives in
-//!   this process's memory only. Each sign-in revokes this folder's older
+//!   this process's memory only. Each sign-in revokes this Ambition's older
 //!   sessions, so they do not pile up. (A token from `t3 auth session issue`
 //!   is capped at approval-required, so it cannot drive a full-access thread.)
 //! - Then tools: thread launch, send, wait, read, configure, interrupt and
@@ -42,7 +42,7 @@ struct Conn {
 }
 
 impl T3 {
-    /// `label` names this folder's sign-ins in T3's session list.
+    /// `label` names this Ambition's sign-ins in T3's session list.
     pub fn new(label: &str) -> T3 {
         let home = std::env::var_os("T3CODE_HOME").map(PathBuf::from).unwrap_or_else(|| crate::util::home().join(".t3"));
         let cli = std::env::var_os("AMBITION_T3_CLI").map(PathBuf::from).unwrap_or_else(|| home.join("bin").join("t3"));
@@ -111,7 +111,7 @@ impl T3 {
         Ok(Conn { origin: o, token, session: String::new(), n: 0 })
     }
 
-    /// Revoke this folder's earlier sign-ins, keeping the newest (this one).
+    /// Revoke this Ambition's earlier sign-ins, keeping the newest (this one).
     fn revoke_old(&self) {
         let Ok(text) = self.cli(&["auth", "session", "list", "--json"]) else { return };
         let Ok(Value::Array(rows)) = serde_json::from_str::<Value>(&text) else { return };

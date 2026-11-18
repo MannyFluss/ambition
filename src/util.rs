@@ -1,4 +1,5 @@
-//! Small things several parts need: the time, random tokens, the home folder.
+//! Small things several parts need: the time, random tokens, the home folder
+//! and Ambition's own.
 
 use std::path::{Path, PathBuf};
 
@@ -36,14 +37,20 @@ pub fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Where Ambition keeps what must not sit inside a watched folder:
-/// `$XDG_DATA_HOME/ambition`, else `~/.local/share/ambition`.
-pub fn data_dir() -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
+/// Where Ambition keeps everything it keeps: `$AMBITION_HOME` when set (tests
+/// and trials use their own), else `~/.ambition`. Nothing lives in your
+/// folders.
+pub fn state_dir() -> PathBuf {
+    std::env::var_os("AMBITION_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| home().join(".local").join("share"))
-        .join("ambition")
+        .unwrap_or_else(|| home().join(".ambition"))
+}
+
+/// The state dir as it really is on disk, so paths compare.
+pub fn state_real() -> PathBuf {
+    let d = state_dir();
+    std::fs::canonicalize(&d).unwrap_or(d)
 }
 
 /// `~/notes` → `/Users/you/notes`.

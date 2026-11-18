@@ -1,21 +1,19 @@
 //! `ambition lsp`: the language server. Any editor that speaks LSP can start
-//! it. It acts only on files inside a folder Ambition watches (one with a
-//! `.ambition/` folder above the file), knows what the buffer says as you
-//! type, and reads what the app writes in `.ambition/`: `state.json` (the run
-//! going now), `models.json` and `thread.json`. It never writes a file and
-//! never calls a model.
+//! it. It knows what the buffer says as you type, and reads what Ambition
+//! writes in `~/.ambition/`: `state.json` (the presses on their way),
+//! `models.json` and `threads`. It never writes a file, never calls a model,
+//! and never sends anything: only a press does.
 //!
 //! - Colors (semantic tokens): `^` prompts, `^/` commands, `^>` replies, and
 //!   status lines.
 //! - Completion: command names after `^/`, models after `^/model `, efforts
 //!   after a model.
-//! - Hover: what a command does; on a prompt, what is around its caret and
-//!   what the agent will be sent.
-//! - Highlight: with the cursor on a `^` line, the paragraphs just above and
-//!   below it light up, before you save: what the agent is told it is near.
-//! - Diagnostics: an unknown command, `^ /x` with a space, a prompt waiting
-//!   for a run, a running prompt's state, a status line with no run.
-//! - Inlay hints: what is around each prompt, what each command does, how
+//! - Hover: what a command does; on a prompt, what a press on it sends.
+//! - Highlight: with the cursor on a `^` line, the lines a press sends light
+//!   up: 8 above it and 8 below.
+//! - Diagnostics: an unknown command, `^ /x` with a space, a folder busy with
+//!   another turn, a running prompt's state, a status line with no run.
+//! - Inlay hints: the lines each prompt sends, what each command does, how
 //!   long the agent has worked.
 //! - Code actions: keep a reply (drop its `^>`), make `^ /x` a command, fix a
 //!   misspelt command.
@@ -23,7 +21,7 @@
 use crate::carets as C;
 use crate::commands as Cm;
 use crate::diff;
-use crate::folder::DOT;
+use crate::hook;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, Write};
@@ -41,8 +39,9 @@ const CM: u32 = 5;
 
 struct Doc {
     text: String,
+    /// The file's name, which says how its carets are written.
     rel: String,
-    root: PathBuf,
+    path: PathBuf,
 }
 
 struct Server {
@@ -122,24 +121,6 @@ fn md(text: String) -> Value {
     json!({"contents": {"kind": "markdown", "value": text}})
 }
 
-/// The watched folder a file is in: the nearest folder above it with a
-/// `.ambition/` folder. (root, path relative to it)
-fn locate(path: &Path) -> Option<(PathBuf, String)> {
-    let p = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut dir = p.parent();
-    while let Some(d) = dir {
-        if d.join(DOT).is_dir() {
-            let rel = p.strip_prefix(d).ok()?.to_string_lossy().replace('\\', "/");
-            if rel.split('/').any(|x| x.starts_with('.')) {
-                return None;
-            }
-            return Some((d.to_path_buf(), rel));
-        }
-        dir = d.parent();
-    }
-    None
-}
-
 fn path_of(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     let mut p = crate::pkce::urldecode(&rest.replace('+', "%2B"));
@@ -149,17 +130,26 @@ fn path_of(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(p))
 }
 
-fn load(root: &Path, name: &str) -> Value {
-    crate::app::load(&root.join(DOT).join(name))
+fn load(name: &str) -> Value {
+    crate::app::load(&crate::util::state_dir().join(name))
 }
 
-/// What the app is doing for this folder: (is it running, the run going now).
-fn run_state(root: &Path) -> (bool, Option<Value>) {
-    let d = load(root, "state.json");
-    let alive = d["pid"].as_u64().is_some_and(|pid| alive(pid as u32))
-        && root.join(DOT).join("lock").exists();
-    let run = if alive { d.get("run").filter(|r| !r.is_null()).cloned() } else { None };
-    (alive, run)
+/// What Ambition is doing: (is it running, the presses on their way).
+fn run_state() -> (bool, Vec<Value>) {
+    let d = load("state.json");
+    let alive = d["pid"].as_u64().is_some_and(|pid| alive(pid as u32));
+    let turns = if alive { d["turns"].as_array().cloned().unwrap_or_default() } else { Vec::new() };
+    (alive, turns)
+}
+
+/// The press on its way for this status line, if any.
+fn turn_of<'a>(turns: &'a [Value], path: &Path, id: &str) -> Option<&'a Value> {
+    turns.iter().find(|t| t["id"] == json!(id) && t["doc"].as_str() == Some(&path.to_string_lossy()))
+}
+
+/// A turn with an agent now in the folder that holds this file.
+fn busy_with<'a>(turns: &'a [Value], path: &Path) -> Option<&'a Value> {
+    turns.iter().find(|t| t["state"] == "working" && t["folder"].as_str().is_some_and(|f| path.starts_with(f)))
 }
 
 #[cfg(unix)]
@@ -196,9 +186,8 @@ fn scan<'a>(rel: &str, text: &'a str) -> Scan<'a> {
     Scan { lines, status, replies, commands, prompts, caret }
 }
 
-/// What a caret at line `start` acts on: the paragraph (or last list item)
-/// just above, as the app reads it once the caret lines are gone; None for
-/// the whole file.
+/// What a caret at line `start` acts on, for a command's stdin: the
+/// paragraph (or last list item) just above.
 fn target(rel: &str, sc: &Scan, start: usize) -> Option<(usize, usize)> {
     C::above(rel, &sc.lines, start, &sc.caret)
 }
@@ -206,24 +195,21 @@ fn target(rel: &str, sc: &Scan, start: usize) -> Option<(usize, usize)> {
 /// 0-based (start, end) lines, end exclusive.
 type Span = (usize, usize);
 
-/// The text around a prompt's caret, as the agent is told of it: the
-/// paragraph (or last list item) just above, and the paragraph just below.
-fn around(rel: &str, sc: &Scan, p: &C::Prompt) -> (Option<Span>, Option<Span>) {
-    (target(rel, sc, p.start), C::below(&sc.lines, p.end - 1, &sc.caret))
+/// The lines a press on this prompt sends, 0-based: 8 above it and 8 below,
+/// in the file as it will be once the prompt is a status line.
+fn window(sc: &Scan, p: &C::Prompt) -> (Option<Span>, Option<Span>) {
+    let n = hook::lines(&sc.lines.join("\n")).len();
+    let up = (p.start > 0).then(|| (p.start.saturating_sub(hook::EACH_WAY), p.start));
+    let down = (p.end < n).then(|| (p.end, (p.end + hook::EACH_WAY).min(n)));
+    (up, down)
 }
 
-/// "↑ lines 3-4 · ↓ line 6", or "the whole file" at the top.
-fn around_label(rel: &str, sc: &Scan, p: &C::Prompt) -> String {
-    match around(rel, sc, p) {
-        (None, _) => "→ the whole file".into(),
-        (Some(up), None) => format!("↑ {}", where_(rel, sc, Some(up))),
-        (Some(up), Some(down)) => format!("↑ {} · ↓ {}", where_(rel, sc, Some(up)), C::span(down.0, down.1)),
-    }
-}
-
-fn whole(sc: &Scan) -> Option<(usize, usize)> {
-    let rows: Vec<usize> = (0..sc.lines.len()).filter(|&i| !sc.lines[i].trim().is_empty() && !sc.caret.contains(&i)).collect();
-    Some((*rows.first()?, rows.last()? + 1))
+/// "sends lines 3-20", in the file's numbers as they are now.
+fn window_label(sc: &Scan, p: &C::Prompt) -> String {
+    let (up, down) = window(sc, p);
+    let lo = up.map(|u| u.0).unwrap_or(p.start);
+    let hi = down.map(|d| d.1).unwrap_or(p.end);
+    format!("a press sends lines {}-{}", lo + 1, hi)
 }
 
 fn where_(rel: &str, sc: &Scan, t: Option<(usize, usize)>) -> String {
@@ -236,42 +222,38 @@ fn where_(rel: &str, sc: &Scan, t: Option<(usize, usize)>) -> String {
     }
 }
 
-/// {name: (description, where it comes from)} of every command for a folder.
-fn all_commands(root: &Path) -> BTreeMap<String, (String, String)> {
+/// {name: (description, where it comes from)} of every command.
+fn all_commands() -> BTreeMap<String, (String, String)> {
     let mut out: BTreeMap<String, (String, String)> = Cm::BUILTINS.iter().map(|(n, d)| (n.to_string(), (d.to_string(), "built in".to_string()))).collect();
-    for (n, p) in Cm::find(root) {
+    for (n, p) in Cm::find() {
         out.entry(n).or_insert_with(|| {
             let d = Cm::describe(&p);
             let file = p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-            (if d.is_empty() { file.clone() } else { d }, format!("runs .ambition/commands/{file}"))
+            (if d.is_empty() { file.clone() } else { d }, format!("runs ~/.ambition/commands/{file}"))
         });
     }
     out
 }
 
-fn models(root: &Path) -> Vec<Value> {
-    load(root, "models.json")["models"].as_array().cloned().unwrap_or_default()
+fn models() -> Vec<Value> {
+    load("models.json")["models"].as_array().cloned().unwrap_or_default()
 }
 
-fn thread_line(root: &Path) -> String {
-    let t = load(root, "thread.json");
+fn thread_line(path: &Path) -> String {
+    let t = load("threads")[path.to_string_lossy().as_ref()].clone();
     let mut bits = Vec::new();
     if let Some(m) = t["model"].as_str() {
         bits.push(format!("model: {m}"));
     }
     match t["link"].as_str().filter(|l| !l.is_empty()) {
-        Some(l) => bits.push(format!("[this folder's thread]({l})")),
-        None => bits.push("no thread yet: the next prompt starts one".into()),
+        Some(l) => bits.push(format!("[this file's thread]({l})")),
+        None => bits.push("no thread yet: this file's first prompt starts one".into()),
     }
     bits.join(" · ")
 }
 
 fn since(run: &Value) -> u64 {
     (crate::util::epoch() - run["since"].as_f64().unwrap_or_else(crate::util::epoch)).max(0.0) as u64
-}
-
-fn ids(run: &Value) -> Vec<String> {
-    run["ids"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_string)).collect()
 }
 
 impl Server {
@@ -316,12 +298,15 @@ impl Server {
                     p["contentChanges"].as_array().and_then(|c| c.last()).and_then(|c| c["text"].as_str()).unwrap_or("").to_string()
                 };
                 let place = if method == "textDocument/didOpen" {
-                    path_of(&uri).and_then(|p| locate(&p))
+                    path_of(&uri).map(|p| {
+                        let p = std::fs::canonicalize(&p).unwrap_or(p);
+                        (p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), p)
+                    })
                 } else {
-                    self.docs.lock().unwrap().get(&uri).map(|d| (d.root.clone(), d.rel.clone()))
+                    self.docs.lock().unwrap().get(&uri).map(|d| (d.rel.clone(), d.path.clone()))
                 };
-                let Some((root, rel)) = place else { return };
-                self.docs.lock().unwrap().insert(uri.clone(), Doc { text, rel, root });
+                let Some((rel, path)) = place else { return };
+                self.docs.lock().unwrap().insert(uri.clone(), Doc { text, rel, path });
                 self.publish(&uri);
             }
             "textDocument/didClose" => {
@@ -340,11 +325,11 @@ impl Server {
                 let range = (p["range"]["start"]["line"].as_u64().unwrap_or(0) as usize, p["range"]["end"]["line"].as_u64().unwrap_or(0) as usize);
                 let result = match method {
                     "textDocument/semanticTokens/full" => tokens(&d.rel, &d.text),
-                    "textDocument/completion" => json!({"isIncomplete": false, "items": completion(&d.root, &d.rel, &d.text, pos)}),
-                    "textDocument/hover" => hover(&d.root, &d.rel, &d.text, pos.0),
-                    "textDocument/documentHighlight" => highlights(&d.root, &d.rel, &d.text, pos.0),
-                    "textDocument/inlayHint" => inlay_hints(&d.root, &d.rel, &d.text, range),
-                    "textDocument/codeAction" => code_actions(&d.root, uri, &d.rel, &d.text, range),
+                    "textDocument/completion" => json!({"isIncomplete": false, "items": completion(&d.path, &d.rel, &d.text, pos)}),
+                    "textDocument/hover" => hover(&d.path, &d.rel, &d.text, pos.0),
+                    "textDocument/documentHighlight" => highlights(&d.rel, &d.text, pos.0),
+                    "textDocument/inlayHint" => inlay_hints(&d.path, &d.rel, &d.text, range),
+                    "textDocument/codeAction" => code_actions(uri, &d.rel, &d.text, range),
                     _ => {
                         drop(docs);
                         return self.send(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("{method} is not handled")}}));
@@ -360,35 +345,31 @@ impl Server {
         let diags = {
             let docs = self.docs.lock().unwrap();
             let Some(d) = docs.get(uri) else { return };
-            diagnostics(&d.root, &d.rel, &d.text)
+            diagnostics(&d.path, &d.rel, &d.text)
         };
         self.send(json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": diags}}));
     }
 
-    /// Re-publish diagnostics when an app's state changes, and every few
-    /// seconds while a run goes (for its clock). Otherwise it sleeps.
+    /// Re-publish diagnostics when Ambition's state changes, and every few
+    /// seconds while a turn runs (for its clock). Otherwise it sleeps.
     fn watch_state(self: Arc<Self>) {
         use notify::Watcher;
         let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let mut watching: BTreeSet<PathBuf> = BTreeSet::new();
         let tx2 = tx.clone();
         let mut watcher = notify::recommended_watcher(move |_e: notify::Result<notify::Event>| {
             let _ = tx2.send(());
         })
         .ok();
+        let dir = crate::util::state_dir();
+        let mut watching = false;
         loop {
-            let roots: BTreeSet<PathBuf> = self.docs.lock().unwrap().values().map(|d| d.root.clone()).collect();
-            if let Some(w) = watcher.as_mut() {
-                for r in roots.difference(&watching.clone()) {
-                    if w.watch(&r.join(DOT).join("state.json"), notify::RecursiveMode::NonRecursive).is_ok()
-                        || w.watch(&r.join(DOT), notify::RecursiveMode::NonRecursive).is_ok()
-                    {
-                        watching.insert(r.clone());
-                    }
+            if !watching {
+                if let Some(w) = watcher.as_mut() {
+                    watching = w.watch(&dir, notify::RecursiveMode::NonRecursive).is_ok();
                 }
             }
-            let running = roots.iter().any(|r| run_state(r).1.is_some());
-            let wait = if running { Duration::from_secs(3) } else if watcher.is_some() { Duration::from_secs(30) } else { Duration::from_secs(2) };
+            let running = !run_state().1.is_empty();
+            let wait = if running { Duration::from_secs(3) } else if watching { Duration::from_secs(30) } else { Duration::from_secs(5) };
             let _ = rx.recv_timeout(wait);
             while rx.try_recv().is_ok() {}
             let uris: Vec<String> = self.docs.lock().unwrap().keys().cloned().collect();
@@ -459,7 +440,7 @@ fn efforts(m: &Value) -> Vec<String> {
     m["efforts"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_string)).collect()
 }
 
-fn completion(root: &Path, rel: &str, text: &str, pos: (usize, u32)) -> Vec<Value> {
+fn completion(path: &Path, rel: &str, text: &str, pos: (usize, u32)) -> Vec<Value> {
     let lines: Vec<&str> = text.split('\n').collect();
     let Some(line) = lines.get(pos.0) else { return vec![] };
     let prefix = &line[..byte_at(line, pos.1)];
@@ -470,7 +451,7 @@ fn completion(root: &Path, rel: &str, text: &str, pos: (usize, u32)) -> Vec<Valu
     let parts: Vec<&str> = cmd.split(' ').collect();
     if parts.len() == 1 && cmd.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
         let col = u16len(&prefix[..a + 2]);
-        return all_commands(root).into_iter().map(|(n, (d, how))| {
+        return all_commands().into_iter().map(|(n, (d, how))| {
             let builtin = Cm::is_builtin(&n);
             json!({"label": n, "kind": if builtin { 14 } else { 3 }, "detail": crate::util::cut(&d, 80),
                 "documentation": {"kind": "markdown", "value": format!("`^/{n}` — {d}\n\n{how}")},
@@ -480,8 +461,8 @@ fn completion(root: &Path, rel: &str, text: &str, pos: (usize, u32)) -> Vec<Valu
     if parts.first() != Some(&"model") {
         return vec![];
     }
-    let cur = load(root, "thread.json")["model"].as_str().unwrap_or("").to_string();
-    let ms = models(root);
+    let cur = load("threads")[path.to_string_lossy().as_ref()]["model"].as_str().unwrap_or("").to_string();
+    let ms = models();
     let words: Vec<&str> = parts[1..].iter().cloned().filter(|w| !w.is_empty()).collect();
     let typing = !prefix.ends_with(' ');
     if words.is_empty() || (words.len() == 1 && typing) {
@@ -505,57 +486,35 @@ fn completion(root: &Path, rel: &str, text: &str, pos: (usize, u32)) -> Vec<Valu
     vals.iter().enumerate().map(|(k, v)| json!({"label": v, "kind": 20, "detail": "effort", "sortText": format!("{k:02}"), "textEdit": edit(col, v)})).collect()
 }
 
-fn prompt_card(root: &Path, rel: &str, sc: &Scan, p: &C::Prompt, run: &Option<Value>) -> String {
-    let (up, down) = around(rel, sc, p);
-    let real: Vec<usize> = (0..sc.lines.len()).filter(|k| !sc.caret.contains(k)).collect();
-    let chars: usize = real.iter().map(|&k| sc.lines[k].len() + 1).sum();
-    let ctx = if real.len() <= 78 && chars <= 5800 { "this whole file" } else { "the lines around the caret (the file is long)" };
-    let mut body = vec!["**`^` prompt** — on save it goes to this folder's thread.".to_string(), String::new()];
+fn prompt_card(path: &Path, sc: &Scan, p: &C::Prompt, turns: &[Value]) -> String {
+    let mut body = vec!["**`^` prompt** — a press on it (your editor's Ambition key) sends it to this file's thread. Saving sends nothing.".to_string(), String::new()];
     if let Some(name) = p.text.trim_start().strip_prefix('/') {
         let name = name.split(' ').next().unwrap_or("");
         body.push(format!("This starts with `^ /`: the space makes it a prompt. For the command, write `^/{name}`."));
         body.push(String::new());
     }
-    let quote = |(s, e): (usize, usize)| {
-        let mut q: Vec<String> = sc.lines[s..e].iter().take(3).map(|q| format!("> {}", q.replace('*', "\\*").replace('_', "\\_"))).collect();
-        if e - s > 3 {
-            q.push("> …".into());
-        }
-        q.join("  \n")
-    };
-    match (up, down) {
-        (None, _) => body.push("**Around the caret:** the whole file (the prompt is on its first line).".into()),
-        (Some(u), d) => {
-            body.push(format!("**Around the caret:** above, {}{}. Your words decide which it acts on.", where_(rel, sc, Some(u)),
-                d.map(|d| format!("; below, {}", C::span(d.0, d.1))).unwrap_or_default()));
-            body.push(String::new());
-            body.push(quote(u));
-            if let Some(d) = d {
-                body.push(String::new());
-                body.push("below:".into());
-                body.push(quote(d));
-            }
-            body.push(String::new());
-        }
-    }
-    body.push(format!("**The agent is sent:** your words; where the caret is and the paragraphs above and below it, by line numbers; {ctx}, as it is on disk; and what you typed in this folder since its last turn. It remembers the thread, and can read anything else itself."));
+    let (up, down) = window(sc, p);
+    let say = |t: Option<Span>, none: &str| t.map(|(s, e)| C::span(s, e)).unwrap_or_else(|| none.to_string());
+    body.push(format!("**The agent is sent:** your words; where this file is; {} above and {} below, as they are on disk; and \
+        what changed in this file since its last turn. Nothing else is attached: it asks for more with `ambition more up` or \
+        `ambition more down`, and can read anything itself.", say(up, "nothing"), say(down, "nothing")));
     body.push(String::new());
-    body.push(thread_line(root));
-    if let Some(r) = run {
+    body.push(thread_line(path));
+    if let Some(t) = busy_with(turns, path) {
         body.push(String::new());
-        body.push(format!("The agent is working on {} now: this prompt runs when that turn ends.", ids(r).join(", ")));
+        body.push(format!("An agent is working on {} in this folder now: a press here waits for it.", t["id"].as_str().unwrap_or("a prompt")));
     }
     body.join("\n")
 }
 
-fn hover(root: &Path, rel: &str, text: &str, i: usize) -> Value {
+fn hover(path: &Path, rel: &str, text: &str, i: usize) -> Value {
     let sc = scan(rel, text);
     if i >= sc.lines.len() {
         return Value::Null;
     }
-    let (alive, run) = run_state(root);
+    let (alive, turns) = run_state();
     if let Some(c) = sc.commands.iter().find(|c| c.line == i) {
-        let cmds = all_commands(root);
+        let cmds = all_commands();
         let Some((d, how)) = cmds.get(&c.name) else {
             let near = diff::closest(&c.name, cmds.keys().map(String::as_str));
             return md(format!("**`^/{}`** is no command.{}\n\n`^/help` lists them.", c.name,
@@ -563,17 +522,17 @@ fn hover(root: &Path, rel: &str, text: &str, i: usize) -> Value {
         };
         let mut body = format!("**`^/{}`** — {d}\n\n", c.name);
         if Cm::is_builtin(&c.name) {
-            body.push_str("Built in. Runs the moment you save, with no model.");
+            body.push_str("Built in. A press on it runs it at once, with no model.");
         } else {
             let t = target(rel, &sc, i);
-            body.push_str(&format!("{} the moment you save, with no model. It reads {} on stdin, and what it prints becomes the reply.",
+            body.push_str(&format!("{}: a press on it runs it at once, with no model. It reads {} on stdin, and what it prints becomes the reply.",
                 capital(how), t.map(|_| where_(rel, &sc, t)).unwrap_or_else(|| "nothing".into())));
         }
         if c.name == "model" || c.name == "thread" {
-            body.push_str(&format!("\n\n{}", thread_line(root)));
+            body.push_str(&format!("\n\n{}", thread_line(path)));
         }
         if c.name == "model" {
-            let ms = models(root);
+            let ms = models();
             if !ms.is_empty() {
                 let rows: Vec<String> = ms.iter().map(|m| format!("- {} (`{}`)", m["label"].as_str().unwrap_or(""), m["model"].as_str().unwrap_or(""))).collect();
                 body.push_str(&format!("\n\n{}", rows.join("\n")));
@@ -582,19 +541,22 @@ fn hover(root: &Path, rel: &str, text: &str, i: usize) -> Value {
         return md(body);
     }
     if let Some(pid) = sc.status.get(&i) {
-        if let Some(r) = run.as_ref().filter(|r| ids(r).contains(pid)) {
-            let thread = r["thread"].as_str().filter(|t| !t.is_empty()).map(|t| format!(" [Watch it in the thread]({t}).")).unwrap_or_default();
-            return md(format!("**{pid}** is with the agent ({}), {} s so far.{thread}\n\n`^/stop` stops it. Ambition removes this line when the turn ends.",
-                r["model"].as_str().unwrap_or("the engine"), since(r)));
+        if let Some(t) = turn_of(&turns, path, pid) {
+            if t["state"] == "waiting" {
+                return md(format!("**{pid}** is waiting: another turn is running in this folder, and one runs at a time. It goes next."));
+            }
+            let thread = t["thread"].as_str().filter(|t| !t.is_empty()).map(|t| format!(" [Watch it in the thread]({t}).")).unwrap_or_default();
+            return md(format!("**{pid}** is with the agent, {} s so far.{thread}\n\n`^/stop` stops it. Ambition removes this line when the turn ends.",
+                since(t)));
         }
-        return md(format!("**{pid}**: no run is behind this status line.{}",
-            if alive { "" } else { " Ambition is not running for this folder: start it with `ambition <folder>`." }));
+        return md(format!("**{pid}**: no turn is behind this status line.{}",
+            if alive { "" } else { " Ambition is not running: start it with `ambition`." }));
     }
     if sc.replies.contains(&i) {
-        return md("A reply. Your next save clears it. To keep the text, delete its `^>` (the code action **Keep this reply** does that).".into());
+        return md("A reply. Your next press in this file clears it. To keep the text, delete its `^>` (the code action **Keep this reply** does that).".into());
     }
     if let Some(p) = sc.prompts.iter().find(|p| p.start <= i && i < p.end) {
-        return md(prompt_card(root, rel, &sc, p, &run));
+        return md(prompt_card(path, &sc, p, &turns));
     }
     Value::Null
 }
@@ -607,34 +569,29 @@ fn capital(s: &str) -> String {
     }
 }
 
-fn highlights(root: &Path, rel: &str, text: &str, i: usize) -> Value {
-    let _ = root;
+fn highlights(rel: &str, text: &str, i: usize) -> Value {
     let sc = scan(rel, text);
-    let mut t = None;
+    let range = |(s, e): Span| json!({"range": line_range(&sc.lines, s, e), "kind": 1});
     if let Some(p) = sc.prompts.iter().find(|p| p.start <= i && i < p.end) {
-        return match around(rel, &sc, p) {
-            (None, _) => whole(&sc).map(|(s, e)| json!([{"range": line_range(&sc.lines, s, e), "kind": 1}])).unwrap_or(json!([])),
-            (Some(u), d) => json!([u].into_iter().chain(d).map(|(s, e)| json!({"range": line_range(&sc.lines, s, e), "kind": 1})).collect::<Vec<_>>()),
-        };
+        let (up, down) = window(&sc, p);
+        return json!(up.into_iter().chain(down).filter(|(s, e)| e > s).map(range).collect::<Vec<_>>());
     }
+    let mut t = None;
     if let Some(c) = sc.commands.iter().find(|c| c.line == i) {
         if !Cm::is_builtin(&c.name) {
             t = target(rel, &sc, i);
         }
     }
-    if sc.status.contains_key(&i) {
-        t = target(rel, &sc, i);
-    }
     match t {
-        Some((s, e)) => json!([{"range": line_range(&sc.lines, s, e), "kind": 1}]),
+        Some(t) => json!([range(t)]),
         None => json!([]),
     }
 }
 
-fn diagnostics(root: &Path, rel: &str, text: &str) -> Vec<Value> {
+fn diagnostics(path: &Path, rel: &str, text: &str) -> Vec<Value> {
     let sc = scan(rel, text);
-    let (alive, run) = run_state(root);
-    let cmds = all_commands(root);
+    let (alive, turns) = run_state();
+    let cmds = all_commands();
     let mut out = Vec::new();
     for c in &sc.commands {
         if !cmds.contains_key(&c.name) && !cmds.keys().any(|n| n.starts_with(&c.name)) {
@@ -646,6 +603,7 @@ fn diagnostics(root: &Path, rel: &str, text: &str) -> Vec<Value> {
                 "message": format!("no command ^/{}{} ^/help lists them.", c.name, near.map(|n| format!(": did you mean ^/{n}?")).unwrap_or_else(|| ".".into()))}));
         }
     }
+    let busy = busy_with(&turns, path);
     for p in &sc.prompts {
         if let Some(name) = p.text.trim_start().strip_prefix('/') {
             let name = name.split(' ').next().unwrap_or("").to_lowercase();
@@ -654,37 +612,37 @@ fn diagnostics(root: &Path, rel: &str, text: &str) -> Vec<Value> {
                     "message": format!("the space after ^ makes this a prompt for the agent. For the command, write ^/{name}.")}));
             }
         }
-        if let Some(r) = &run {
-            out.push(json!({"range": line_range(&sc.lines, p.start, p.end), "severity": 4, "source": "Ambition",
-                "message": format!("the agent is working on {}: this prompt runs when that turn ends.", ids(r).join(", "))}));
+        if let Some(t) = busy {
+            out.push(json!({"range": line_range(&sc.lines, p.start, p.end), "severity": 4, "source": "Ambition", "code": "busy",
+                "message": format!("an agent is working on {} in this folder: a press here waits for it.", t["id"].as_str().unwrap_or("a prompt"))}));
         }
     }
     for (&i, pid) in &sc.status {
         let l = sc.lines[i];
-        match &run {
-            Some(r) if ids(r).contains(pid) => {
+        match turn_of(&turns, path, pid) {
+            Some(t) if t["state"] == "waiting" => out.push(json!({"range": line_range(&sc.lines, i, i + 1), "severity": 3, "source": "Ambition",
+                "code": "waiting", "message": format!("{pid} · waiting for its folder: one turn at a time runs there")})),
+            Some(t) => {
                 let what = l.split_once('·').map(|x| x.1.trim()).unwrap_or("working");
-                let t = target(rel, &sc, i);
-                let thread = r["thread"].as_str().filter(|t| !t.is_empty()).map(|t| format!(" · {t}")).unwrap_or_default();
-                out.push(json!({"range": t.map(|(s, e)| line_range(&sc.lines, s, e)).unwrap_or_else(|| line_range(&sc.lines, i, i + 1)),
-                    "severity": 3, "source": "Ambition", "code": "running", "message": format!("{pid} · {what} · {} s{thread}", since(r))}));
+                let thread = t["thread"].as_str().filter(|t| !t.is_empty()).map(|t| format!(" · {t}")).unwrap_or_default();
+                out.push(json!({"range": line_range(&sc.lines, i, i + 1), "severity": 3, "source": "Ambition", "code": "running",
+                    "message": format!("{pid} · {what} · {} s{thread}", since(t))}));
             }
-            Some(_) => {}
             None => out.push(json!({"range": line_range(&sc.lines, i, i + 1), "severity": 2, "source": "Ambition", "code": "stale",
-                "message": format!("{pid}: no run is behind this status line{}", if alive { "." } else { ": Ambition is not running for this folder." })})),
+                "message": format!("{pid}: no turn is behind this status line{}", if alive { "." } else { ": Ambition is not running." })})),
         }
     }
     out
 }
 
-fn inlay_hints(root: &Path, rel: &str, text: &str, (lo, hi): (usize, usize)) -> Value {
+fn inlay_hints(path: &Path, rel: &str, text: &str, (lo, hi): (usize, usize)) -> Value {
     let sc = scan(rel, text);
-    let cmds = all_commands(root);
+    let cmds = all_commands();
     let mut out = Vec::new();
     for p in &sc.prompts {
         let last = p.end - 1;
         if lo <= last && last <= hi {
-            out.push(json!({"position": {"line": last, "character": u16len(sc.lines[last])}, "label": around_label(rel, &sc, p), "paddingLeft": true}));
+            out.push(json!({"position": {"line": last, "character": u16len(sc.lines[last])}, "label": window_label(&sc, p), "paddingLeft": true}));
         }
     }
     for c in &sc.commands {
@@ -694,22 +652,22 @@ fn inlay_hints(root: &Path, rel: &str, text: &str, (lo, hi): (usize, usize)) -> 
             }
         }
     }
-    let (alive, run) = run_state(root);
+    let (alive, turns) = run_state();
     for (&i, pid) in &sc.status {
         if i < lo || i > hi {
             continue;
         }
-        let label = match &run {
-            Some(r) if ids(r).contains(pid) => format!("⏱ {} s · ^/stop stops it", since(r)),
-            Some(_) => continue,
-            None => format!("no run behind this line{}", if alive { "" } else { ": Ambition is not running" }),
+        let label = match turn_of(&turns, path, pid) {
+            Some(t) if t["state"] == "waiting" => "waiting for its folder".to_string(),
+            Some(t) => format!("⏱ {} s · ^/stop stops it", since(t)),
+            None => format!("no turn behind this line{}", if alive { "" } else { ": Ambition is not running" }),
         };
         out.push(json!({"position": {"line": i, "character": u16len(sc.lines[i])}, "label": label, "paddingLeft": true}));
     }
     json!(out)
 }
 
-fn code_actions(root: &Path, uri: &str, rel: &str, text: &str, (lo, hi): (usize, usize)) -> Value {
+fn code_actions(uri: &str, rel: &str, text: &str, (lo, hi): (usize, usize)) -> Value {
     let sc = scan(rel, text);
     let mut acts = Vec::new();
     let act = |acts: &mut Vec<Value>, title: String, edits: Vec<Value>| {
@@ -735,7 +693,7 @@ fn code_actions(root: &Path, uri: &str, rel: &str, text: &str, (lo, hi): (usize,
             act(&mut acts, format!("Keep all {} lines of this reply", block.len()), block.into_iter().map(keep).collect());
         }
     }
-    let cmds = all_commands(root);
+    let cmds = all_commands();
     for p in &sc.prompts {
         let i = p.start;
         if lo <= i && i <= hi {

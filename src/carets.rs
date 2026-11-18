@@ -8,8 +8,8 @@
 //!                         to the agent. One line each.
 //! ^ ◌ p3 · …              a status line Ambition writes while p3 runs.
 //!                         Never a prompt, so a prompt cannot fire twice.
-//! ^> the answer is 4      a reply. The next save clears it; delete the ^>
-//!                         to keep the text.
+//! ^> the answer is 4      a reply. The next press in its file clears it;
+//!                         delete the ^> to keep the text.
 //! ```
 //!
 //! In notes (`.md`, `.txt`, or no extension) a caret counts only at the very
@@ -235,6 +235,15 @@ pub fn clear_replies(rel: &str, text: &str, tidy: bool) -> (String, Vec<String>)
     (keep.join("\n"), gone.iter().map(|&i| lines[i].to_string()).collect())
 }
 
+/// The text without its reply and status lines, nothing else changed: what
+/// undo compares.
+pub fn clear_marks(rel: &str, text: &str) -> String {
+    text.split('\n')
+        .filter(|l| !matches!(kind(rel, l), Some((_, Kind::Reply | Kind::Status(_)))))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Take out a prompt's status line and any markers it has (`p3.2` …), without
 /// leaving a doubled blank line where it stood.
 pub fn remove_marks(rel: &str, text: &str, pid: &str) -> String {
@@ -326,7 +335,7 @@ pub fn reply_lines(lead: &str, body: &str, limit: usize) -> Vec<String> {
     let mut out: Vec<String> =
         rows.iter().take(limit).map(|r| format!("{lead}^> {r}").trim_end().to_string()).collect();
     if rows.len() > limit {
-        out.push(format!("{lead}^> … {} more lines, all in .ambition/history.md", rows.len() - limit));
+        out.push(format!("{lead}^> … {} more lines, all in this folder's history in ~/.ambition/history", rows.len() - limit));
     }
     out
 }
@@ -463,6 +472,11 @@ mod tests {
     }
 
     #[test]
+    fn marks_go_for_undo() {
+        assert_eq!(clear_marks("a.md", "a\n^> r\n^ ◌ p1 · w\n^ keep\nb"), "a\n^ keep\nb");
+    }
+
+    #[test]
     fn clearing_replies_leaves_no_double_gap() {
         let t = "one\n\n^> a\n^> b\n\ntwo\n";
         assert_eq!(clear_replies("a.md", t, true).0, "one\n\ntwo\n");
@@ -492,7 +506,7 @@ mod tests {
         let r = reply_lines("# ", &body, 12);
         assert_eq!(r.len(), 13);
         assert_eq!(r[0], "# ^> 1");
-        assert!(r[12].ends_with("2 more lines, all in .ambition/history.md"));
+        assert!(r[12].ends_with("2 more lines, all in this folder's history in ~/.ambition/history"));
         assert_eq!(reply_lines("", "x\n\n", 12), vec!["^> x"]);
     }
 

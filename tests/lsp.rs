@@ -13,8 +13,8 @@ struct Lsp {
 }
 
 impl Lsp {
-    fn start() -> Lsp {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ambition")).arg("lsp")
+    fn start(state: &Path) -> Lsp {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ambition")).arg("lsp").env("AMBITION_HOME", state)
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let out = BufReader::new(child.stdout.take().unwrap());
         Lsp { child, out, n: 0, notes: Vec::new() }
@@ -72,25 +72,27 @@ fn the_language_server() {
     let root = std::env::temp_dir().join(format!("ambition-lsp-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let dir = root.join("notes");
-    std::fs::create_dir_all(dir.join(".ambition/commands")).unwrap();
+    let state = root.join("state");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(state.join("commands")).unwrap();
     let dir = std::fs::canonicalize(&dir).unwrap();
-    std::fs::write(dir.join(".ambition/commands/count.sh"), "#!/bin/sh\n# Count the words above.\nwc -w\n").unwrap();
-    std::fs::write(dir.join(".ambition/models.json"), json!({"models": [
+    std::fs::write(state.join("commands/count.sh"), "#!/bin/sh\n# Count the words above.\nwc -w\n").unwrap();
+    std::fs::write(state.join("models.json"), json!({"models": [
         {"instance": "claudeAgent", "provider": "Claude", "model": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5", "effortId": "effort", "efforts": ["low", "high"]},
         {"instance": "codex", "provider": "Codex", "model": "gpt-5.5", "label": "GPT-5.5", "effortId": "reasoningEffort", "efforts": []}]}).to_string()).unwrap();
-    std::fs::write(dir.join(".ambition/thread.json"), json!({"model": "Claude Sonnet 5.5", "link": "t3://thread/x"}).to_string()).unwrap();
-    let text = "Intro paragraph.\n\nSome text here\nthat spans two lines.\n^ make this shorter\n\n- one\n- two\n^ expand this\n\n^/help\n^/modle\n^ /help\n^> a reply\n^> second line\n^ ◌ p9 · stale · working\n^/count\n";
     let file = dir.join("notes.md");
+    std::fs::write(state.join("threads"), json!({file.to_string_lossy(): {"model": "Claude Sonnet 5.5", "link": "t3://thread/x"}}).to_string()).unwrap();
+    let text = "Intro paragraph.\n\nSome text here\nthat spans two lines.\n^ make this shorter\n\n- one\n- two\n^ expand this\n\n^/help\n^/modle\n^ /help\n^> a reply\n^> second line\n^ ◌ p9 · stale · working\n^/count\n";
     std::fs::write(&file, text).unwrap();
-    let outside = root.join("elsewhere.md");
-    std::fs::write(&outside, "^ not watched\n").unwrap();
+    let elsewhere = root.join("elsewhere.md");
+    std::fs::write(&elsewhere, "Any file.\n^ works the same\n").unwrap();
 
-    let mut l = Lsp::start();
+    let mut l = Lsp::start(&state);
     let init = l.ask("initialize", json!({"capabilities": {}}));
     assert_eq!(init["capabilities"]["positionEncoding"], "utf-16");
     l.tell("initialized", json!({}));
     l.tell("textDocument/didOpen", json!({"textDocument": {"uri": uri(&file), "languageId": "markdown", "version": 1, "text": text}}));
-    l.tell("textDocument/didOpen", json!({"textDocument": {"uri": uri(&outside), "languageId": "markdown", "version": 1, "text": "^ not watched\n"}}));
+    l.tell("textDocument/didOpen", json!({"textDocument": {"uri": uri(&elsewhere), "languageId": "markdown", "version": 1, "text": "Any file.\n^ works the same\n"}}));
     let doc = json!({"uri": uri(&file)});
 
     let tokens = l.ask("textDocument/semanticTokens/full", json!({"textDocument": doc}));
@@ -104,19 +106,21 @@ fn the_language_server() {
 
     let hov = l.ask("textDocument/hover", json!({"textDocument": doc, "position": {"line": 4, "character": 3}}));
     let card = hov["contents"]["value"].as_str().unwrap();
-    assert!(card.contains("**Around the caret:** above, lines 3-4; below, lines 7-8.") && card.contains("> Some text here"), "{card}");
+    assert!(card.contains("a press on it (your editor's Ambition key) sends it") && card.contains("Saving sends nothing")
+        && card.contains("lines 1-4 above and lines 6-13 below") && card.contains("[this file's thread](t3://thread/x)"), "{card}");
     let hov = l.ask("textDocument/hover", json!({"textDocument": doc, "position": {"line": 16, "character": 2}}));
     assert!(hov["contents"]["value"].as_str().unwrap().contains("Count the words above."), "{hov}");
 
+    // What a press sends lights up: 8 lines above the prompt and 8 below.
     let hl = l.ask("textDocument/documentHighlight", json!({"textDocument": doc, "position": {"line": 4, "character": 1}}));
-    assert_eq!((hl[0]["range"]["start"]["line"].clone(), hl[0]["range"]["end"]["line"].clone()), (json!(2), json!(3)), "above: {hl}");
-    assert_eq!((hl[1]["range"]["start"]["line"].clone(), hl[1]["range"]["end"]["line"].clone()), (json!(6), json!(7)), "below: {hl}");
+    assert_eq!((hl[0]["range"]["start"]["line"].clone(), hl[0]["range"]["end"]["line"].clone()), (json!(0), json!(3)), "above: {hl}");
+    assert_eq!((hl[1]["range"]["start"]["line"].clone(), hl[1]["range"]["end"]["line"].clone()), (json!(5), json!(12)), "below: {hl}");
     let hl = l.ask("textDocument/documentHighlight", json!({"textDocument": doc, "position": {"line": 8, "character": 1}}));
-    assert_eq!((hl[0]["range"]["start"]["line"].clone(), hl[0]["range"]["end"]["line"].clone()), (json!(7), json!(7)), "under a list, the last item");
+    assert_eq!((hl[0]["range"]["start"]["line"].clone(), hl[0]["range"]["end"]["line"].clone()), (json!(0), json!(7)), "{hl}");
 
     let hints = l.ask("textDocument/inlayHint", json!({"textDocument": doc, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 20, "character": 0}}}));
     let labels: Vec<String> = hints.as_array().unwrap().iter().map(|h| h["label"].as_str().unwrap().to_string()).collect();
-    assert!(labels.contains(&"↑ lines 3-4 · ↓ lines 7-8".to_string()) && labels.contains(&"↑ line 8 (the last list item)".to_string())
+    assert!(labels.contains(&"a press sends lines 1-13".to_string()) && labels.contains(&"a press sends lines 1-17".to_string())
         && labels.contains(&"→ list the commands".to_string()), "{labels:?}");
 
     let acts = |l: &mut Lsp, line: usize| -> Vec<String> {
@@ -141,9 +145,9 @@ fn the_language_server() {
         .flat_map(|n| n["params"]["diagnostics"].as_array().cloned().unwrap_or_default()).collect();
     let codes: Vec<&str> = diags.iter().filter_map(|d| d["code"].as_str()).collect();
     assert!(codes.contains(&"no-command") && codes.contains(&"spaced-command") && codes.contains(&"stale"), "{codes:?}");
-    assert!(!l.notes.iter().any(|n| n["params"]["uri"] == json!(uri(&outside))), "a file outside a watched folder is left alone");
-    let empty = l.ask("textDocument/semanticTokens/full", json!({"textDocument": {"uri": uri(&outside)}}));
-    assert_eq!(empty["data"], json!([]));
+    // Any file is the same: a press works everywhere, so the colors do too.
+    let any = l.ask("textDocument/semanticTokens/full", json!({"textDocument": {"uri": uri(&elsewhere)}}));
+    assert_eq!(&any["data"].as_array().unwrap()[..5], &[json!(1), json!(0), json!(1), json!(0), json!(0)], "{any}");
 
     let _ = l.ask("shutdown", Value::Null);
     l.tell("exit", Value::Null);

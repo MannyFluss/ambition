@@ -1,21 +1,27 @@
-//! The context experiment: which way of showing the agent where the writer
-//! is looking gets the right part of the file changed?
+//! The context experiment: does a press send the agent enough to change the
+//! right part of the file?
 //!
 //! Each case is a file with one caret prompt whose right answer is known.
-//! Each method builds Ambition's real first message (rules and save) its own
-//! way. Every run is a fresh T3 thread, so runs cannot learn from each other.
+//! Every run goes through Ambition's real press: a running `App` with its own
+//! inbox (so `ambition more` works), a fresh document, so a fresh T3 thread,
+//! and the real hook: the prompt, 8 lines each way, and nothing else. Runs
+//! cannot learn from each other.
 //!
+//!     cargo build --release
 //!     cargo run --release --example context -- <scratch folder> [reps] [workers] [model words]
 //!
-//! It needs T3 Code running, and it spends real model turns.
+//! It needs T3 Code running, and it spends real model turns. Ambition 0.1
+//! tried four other ways on 2026-11-16 (the paragraph above, above and below,
+//! file and line only, the whole file); that code is at tag v0.1.0.
 
-use ambition::app::{App, Ask, Context};
+use ambition::app::App;
 use ambition::carets as C;
-use ambition::engine::{Engine, Selection, Status};
-use ambition::folder::Folder;
+use ambition::engine::Engine;
+use ambition::inbox;
 use ambition::t3::T3;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -253,92 +259,102 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// Put the case in its folder the way Ambition leaves a file while the agent
-/// works: the prompt out, a status line where it stood.
-fn stage(dir: &Path, case: &Case) -> (String, Ask) {
-    std::fs::create_dir_all(dir).unwrap();
-    let rel = case.file.to_string();
-    let p = C::prompts(&rel, &case.text).remove(0);
-    let (stripped, pos) = C::remove(&case.text, &[(p.start, p.end)]);
-    let status = C::status_line(&p.lead, "p1", &format!("{} · working", ambition::util::cut(&p.text, 48)));
-    let staged = C::insert(&stripped, pos[0], &[status]);
-    std::fs::write(dir.join(&rel), &staged).unwrap();
-    (stripped, Ask { id: "p1".into(), rel, p, pos: pos[0] })
+fn turns(state: &Path) -> Vec<Value> {
+    ambition::app::load(&state.join("state.json"))["turns"].as_array().cloned().unwrap_or_default()
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let root = PathBuf::from(args.first().expect("a scratch folder"));
     let reps: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2);
-    let workers: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(6);
+    let workers: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
     let want = args.get(3).cloned().unwrap_or_else(|| "sonnet 5.5".into());
     std::fs::create_dir_all(&root).unwrap();
     let root = std::fs::canonicalize(&root).unwrap();
-    let t3 = Arc::new(T3::new("Ambition experiment"));
-    let engine: Arc<dyn Engine> = t3.clone();
-    let project = engine.project(&root).expect("a T3 project");
-    let model = engine.models(Some(&want)).expect("models").into_iter().next().expect("the model");
-    let sel = Selection { instance: model.instance.clone(), model: model.id.clone(), effort: None };
-    println!("project {project}, model {} ({})", model.label, model.id);
+    let state = root.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    // This experiment's own Ambition: its own state, inbox and grants.
+    std::env::set_var("AMBITION_HOME", &state);
+    let bin = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("ambition");
+    assert!(bin.exists(), "build the binary first: cargo build --release ({})", bin.display());
 
-    let methods = [Context::Above, Context::Around, Context::Pointer, Context::Whole];
-    let cases = cases();
+    let label = format!("Ambition experiment · {}", &ambition::util::sha(&state.to_string_lossy())[..6]);
+    let t3 = Arc::new(T3::new(&label));
+    let engine: Arc<dyn Engine> = t3.clone();
+    let model = engine.models(Some(&want)).expect("models").into_iter().next().expect("the model");
+    println!("model {} ({})", model.label, model.id);
+    ambition::app::save(&state.join("models.json"), &json!({"last": {"instance": model.instance, "model": model.id, "effort": null}}));
+
+    let mut app = App::new(engine.clone());
+    app.cli = format!("AMBITION_HOME={} {}", state.display(), bin.display());
+    let app = Arc::new(app);
+    app.start().unwrap();
+    // `ambition more` reaches this process, and each call is counted.
+    let more = Arc::new(Mutex::new(std::collections::BTreeMap::<String, usize>::new()));
+    let (a2, m2) = (app.clone(), more.clone());
+    let ib = inbox::Inbox::open().unwrap();
+    std::thread::spawn(move || ib.serve(Arc::new(move |req: &Value| {
+        if req["op"] == "more" {
+            *m2.lock().unwrap().entry(req["cwd"].as_str().unwrap_or("").to_string()).or_default() += 1;
+        }
+        a2.handle(req)
+    })));
+
+    // One folder per worker, a git repo so each run's subfolder belongs to it.
+    let folders: Vec<PathBuf> = (0..workers).map(|w| {
+        let f = root.join(format!("worker-{w}"));
+        std::fs::create_dir_all(f.join(".git")).unwrap();
+        ambition::config::allow(&f).unwrap();
+        std::fs::canonicalize(&f).unwrap()
+    }).collect();
+
+    let cases = Arc::new(cases());
     let mut jobs = Vec::new();
     for rep in 0..reps {
-        for (ci, _) in cases.iter().enumerate() {
-            for m in methods {
-                jobs.push((rep, ci, m));
-            }
+        for ci in 0..cases.len() {
+            jobs.push((rep, ci));
         }
     }
     let jobs = Arc::new(Mutex::new(jobs));
     let results = Arc::new(Mutex::new(Vec::new()));
-    let cases = Arc::new(cases);
+    let used = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
-    for _ in 0..workers {
-        let (jobs, results, cases, engine, root, project, sel) =
-            (jobs.clone(), results.clone(), cases.clone(), engine.clone(), root.clone(), project.clone(), sel.clone());
+    for folder in folders {
+        let (jobs, results, cases, app, engine, state, more, used) =
+            (jobs.clone(), results.clone(), cases.clone(), app.clone(), engine.clone(), state.clone(), more.clone(), used.clone());
         handles.push(std::thread::spawn(move || loop {
-            let Some((rep, ci, m)) = jobs.lock().unwrap().pop() else { break };
+            let Some((rep, ci)) = jobs.lock().unwrap().pop() else { break };
             let case = &cases[ci];
-            let dir = root.join(format!("{:?}", m).to_lowercase()).join(format!("{ci:02}-{rep}"));
+            let dir = folder.join(format!("{ci:02}-{rep}"));
             let _ = std::fs::remove_dir_all(&dir);
-            let (before, ask) = stage(&dir, case);
-            let mut app = App::new(Folder::new(&dir), engine.clone());
-            app.context = m;
-            let msg = app.message(std::slice::from_ref(&ask), &(String::new(), String::new()));
-            let first = format!("{}\n\n{msg}", app.handoff("first", &[]));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join(case.file);
+            std::fs::write(&file, &case.text).unwrap();
+            let p = C::prompts(case.file, &case.text).remove(0);
+            let calls = |m: &Mutex<std::collections::BTreeMap<String, usize>>| m.lock().unwrap().iter()
+                .filter(|(k, _)| Path::new(k.as_str()).starts_with(&folder)).map(|(_, v)| *v).sum::<usize>();
+            let before_more = calls(&more);
             let began = Instant::now();
-            let title = format!("experiment · {:?} · {} · {rep}", m, case.name);
-            let (status, said) = match engine.launch(&project, &title, &first, Some(&sel)) {
-                Ok((tid, run)) => {
-                    let st = engine.wait(&tid, &run, Duration::from_secs(300)).unwrap_or(Status::Failed);
-                    let said = engine.reply(&tid, &run).unwrap_or_default();
-                    let _ = engine.settle(&tid);
-                    (st, said)
-                }
-                Err(e) => (Status::Other(e), String::new()),
-            };
-            let secs = began.elapsed().as_secs_f64();
-            // What Ambition does at the end of a turn: replies left only in the
-            // thread reach the file, then the status line goes.
-            let rel = &ask.rel;
-            let mut after = std::fs::read_to_string(dir.join(rel)).unwrap_or_default();
-            let staged_replies = C::replies(rel, &after).len();
-            if staged_replies == 0 && !said.trim().is_empty() {
-                let marked: Vec<String> = said.lines().filter(|l| l.trim_start().starts_with("^>"))
-                    .map(|l| l.trim_start()[2..].trim_start().to_string()).collect();
-                let unchanged = C::remove_marks(rel, &after, "p1") == before;
-                let body = if !marked.is_empty() { marked.join("\n") } else if unchanged { said.trim().to_string() } else { String::new() };
-                if !body.is_empty() {
-                    after = C::replace_status(rel, &after, "p1", &C::reply_lines(&ask.p.lead, &body, 12));
-                }
+            let sent = app.press(&file.to_string_lossy(), p.start + 1);
+            let id = sent.as_ref().ok().and_then(|s| s.split(' ').next()).unwrap_or("").to_string();
+            let end = Instant::now() + Duration::from_secs(300);
+            while Instant::now() < end && turns(&state).iter().any(|t| t["id"] == json!(id)) {
+                std::thread::sleep(Duration::from_millis(200));
             }
-            let after = C::remove_marks(rel, &after, "p1");
-            let (ok, note) = (case.check)(&before, &after);
-            println!("{} {:<8} {:<40} {:>5.1}s {}", if ok { "pass" } else { "FAIL" }, format!("{:?}", m).to_lowercase(), case.name, secs, note);
-            results.lock().unwrap().push(json!({"method": format!("{:?}", m).to_lowercase(), "case": case.name, "rep": rep,
-                "ok": ok, "note": note, "secs": secs, "status": status.word(), "chars": first.len(), "said": said, "after": after}));
+            let secs = began.elapsed().as_secs_f64();
+            let looked = calls(&more) - before_more;
+            if looked > 0 {
+                used.fetch_add(1, Ordering::Relaxed);
+            }
+            let after = std::fs::read_to_string(&file).unwrap_or_default();
+            let (ok, note) = (case.check)(&case.text, &after);
+            let entry = ambition::app::load(&state.join("threads"))[file.to_string_lossy().as_ref()].clone();
+            if let Some(tid) = entry["thread"].as_str() {
+                let _ = engine.settle(tid);
+            }
+            println!("{} {:<40} {:>5.1}s more:{looked} {note}", if ok { "pass" } else { "FAIL" }, case.name, secs);
+            results.lock().unwrap().push(json!({"case": case.name, "rep": rep, "ok": ok, "note": note, "secs": secs,
+                "more": looked, "sent": sent.unwrap_or_else(|e| e), "thread": entry["link"], "after": after}));
         }));
     }
     for h in handles {
@@ -346,14 +362,10 @@ fn main() {
     }
     let results = results.lock().unwrap().clone();
     std::fs::write(root.join("results.json"), serde_json::to_string_pretty(&results).unwrap()).unwrap();
-    println!("\nmethod    passed   median s   message chars");
-    for m in ["above", "around", "pointer", "whole"] {
-        let rows: Vec<&serde_json::Value> = results.iter().filter(|r| r["method"] == m).collect();
-        let pass = rows.iter().filter(|r| r["ok"] == true).count();
-        let mut secs: Vec<f64> = rows.iter().map(|r| r["secs"].as_f64().unwrap_or(0.0)).collect();
-        secs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let med = secs.get(secs.len() / 2).cloned().unwrap_or(0.0);
-        let chars = rows.iter().map(|r| r["chars"].as_u64().unwrap_or(0)).sum::<u64>() / rows.len().max(1) as u64;
-        println!("{m:<9} {pass:>3}/{:<4} {med:>8.1} {chars:>12}", rows.len());
-    }
+    let pass = results.iter().filter(|r| r["ok"] == true).count();
+    let mut secs: Vec<f64> = results.iter().map(|r| r["secs"].as_f64().unwrap_or(0.0)).collect();
+    secs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med = secs.get(secs.len() / 2).cloned().unwrap_or(0.0);
+    println!("\n{}: passed {pass} of {}, median {med:.1} s a turn, `ambition more` in {} runs",
+        model.label, results.len(), used.load(Ordering::Relaxed));
 }

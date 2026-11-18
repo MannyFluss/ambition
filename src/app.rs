@@ -1,971 +1,798 @@
-//! One folder, watched. A save does nothing unless the file holds a caret
-//! line. Then, on that save:
+//! The running Ambition. It sleeps on its inbox (`inbox.rs`) and does what
+//! each request asks. Saving a file does nothing: a press does, and a press
+//! sends only the caret on the line it names.
 //!
-//! 1. Old `^>` replies in the saved files are cleared.
-//! 2. Every `^/command` and `^ prompt` leaves the file, and the save is
-//!    committed to the private history without them ("Ambition: saved …").
-//! 3. Commands run at once, in code (`commands.rs`), `^/undo` first. Their
-//!    output takes the command's place as `^>` lines. A command written while
-//!    the agent works runs at once too.
-//! 4. A status line goes where each prompt stood: `^ ◌ p3 · <its words> · working`.
-//! 5. The prompts go to the folder's thread as one message that carries the
-//!    writer's attention: each prompt, where its caret is, the file around
-//!    it, and what they changed since the last turn.
-//! 6. When the turn ends, the status lines go, and the turn is one commit
-//!    ("Ambition: agent answered …"), so `^/undo` takes it back.
+//! One press of a `^` prompt:
+//!
+//! 1. The file's folder is found (`config::place`). The first press in a
+//!    folder with no grant asks first.
+//! 2. The file's old `^>` replies go, and the prompt leaves the file: a
+//!    status line stands where it was, `^ ◌ p3 · <its words> · working`, or
+//!    `· waiting for p2` while another turn runs in that folder. One turn at
+//!    a time runs in a folder; other folders run side by side.
+//! 3. When its turn comes, the folder is committed to its private history
+//!    ("Ambition: pressed p3 …"), and the prompt goes to the file's own
+//!    thread with the hook (`hook.rs`).
+//! 4. When the turn ends, the status line goes, and the turn is one commit
+//!    ("Ambition: agent answered p3 …"), so `^/undo` takes it back.
+//!
+//! A press on a `^/command` runs it at once, in code (`commands.rs`); its
+//! output takes the command's place as `^>` lines.
+//!
+//! What Ambition keeps, all in `~/.ambition/`: `threads` (each document's
+//! thread), `state.json` (what is on its way now, for the language server),
+//! `models.json`, `config`, `commands/`, `notes.md`, `coordinator.md`, an
+//! optional `AGENTS.md`, and `history/`.
 
 use crate::carets as C;
 use crate::commands as Cm;
+use crate::config;
 use crate::diff;
 use crate::engine::{Engine, Model, Selection, Status};
-use crate::folder::{Folder, COMMANDS, HISTORY, NOTES};
+use crate::folder::{self, Folder};
+use crate::hook::{self, Since};
+use crate::inbox;
 use crate::util::{self, now};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const RULES: &str = include_str!("../RULES.md");
-
-/// What the agent is shown of where the writer is looking. Ambition uses
-/// `Around`. The other three stay only so the experiment that chose it,
-/// `examples/context.rs`, can be run again. On 2026-11-16, 16 prompts twice
-/// each: with Claude Sonnet 5.5 all four got all 32 runs right; with Claude
-/// Haiku 5.5, Above missed the sentence that goes between two paragraphs
-/// (31 of 32), and the rest got all 32, Pointer at the slowest (17.7 s a turn
-/// against about 10). Whole sends the whole file, which grows with it;
-/// Around stays small.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Context {
-    /// The paragraph above the caret is what "this" means; the file around it.
-    Above,
-    /// The lines above and below the caret, with no default target.
-    Around,
-    /// Only the file and the line; the agent reads the file itself.
-    Pointer,
-    /// The whole file, numbered.
-    Whole,
-}
-
-impl Context {
-    /// The rules' section on where the writer is looking.
-    pub fn attention(self) -> &'static str {
-        match self {
-            Context::Above => ATTENTION_ABOVE,
-            Context::Around | Context::Whole => ATTENTION_AROUND,
-            Context::Pointer => ATTENTION_POINTER,
-        }
-    }
-}
-
-const ATTENTION_ABOVE: &str = "\
-The caret is where they are looking. A prompt acts on the paragraph just
-above it: \"this\" means that paragraph. Under a list in a note, it means the
-last list item, not the whole list, unless their words say otherwise (\"this
-list\", \"these\"). A prompt on the first line of a file is about the whole
-file. Lines in a row that start with `^` are one prompt. In a code file the
-caret may follow a comment marker: `# ^ ...` or `// ^ ...`.
-
-Each message gives you, for every prompt, its file and line, its words, and
-the paragraph just above it by line numbers. It also shows the file as it is
-on disk, with line numbers (all of a short file, else the lines around the
-caret), and what they changed in the folder since your last turn. Edit from
-that text: the Edit tool works on these files without a Read first. When a
-prompt needs more (another file, the history, the web), go and get it.";
-
-const ATTENTION_AROUND: &str = "\
-The caret, the `^` that starts a prompt, is where they are looking, and what
-they mean is around it: the text just above the caret and just below it.
-Read their words against both. \"This\" is often the paragraph above, but a
-prompt can point down (\"fill in the table\", \"the function below\") or at the
-caret's own spot (\"a sentence that joins these\", \"write this section\" under a
-heading). Where their words point, act there. A prompt on the first line of a
-file is about the whole file. Lines in a row that start with `^` are one
-prompt. In a code file the caret may follow a comment marker: `# ^ ...` or
-`// ^ ...`.
-
-Each message gives you, for every prompt, its file and line, its words, and
-the paragraphs just above and below its caret by line numbers. It also shows
-the file as it is on disk, with line numbers (all of a short file, else the
-lines around the caret), and what they changed in the folder since your last
-turn. Edit from that text: the Edit tool works on these files without a Read
-first. When a prompt needs more (another file, the history, the web), go and
-get it.";
-
-const ATTENTION_POINTER: &str = "\
-The caret is where they are looking, and what they mean is around it: the
-text just above the caret and just below it. Read their words against both.
-A prompt on the first line of a file is about the whole file. Lines in a row
-that start with `^` are one prompt. In a code file the caret may follow a
-comment marker: `# ^ ...` or `// ^ ...`.
-
-Each message names, for every prompt, its file, the line its caret is on,
-and its words. Read the file around that line before you act. Each message
-also says what they changed in the folder since your last turn.";
-
-const QUIET: Duration = Duration::from_millis(400);
-const WHOLE_LINES: usize = 80;
-const WHOLE_CHARS: usize = 6000;
-const AROUND: usize = 12;
-const LINE_CUT: usize = 600;
-const DIFF_CHARS: usize = 3000;
+pub const COORDINATOR: &str = "coordinator.md";
 const EFFORT_WORDS: [&str; 9] = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "ultrathink"];
 
-#[derive(Default)]
-struct State {
-    working: bool,
-    /// Files saved since the last pass: their replies are cleared.
-    saved: BTreeSet<String>,
-    /// Files that may hold carets.
-    carets: BTreeSet<String>,
-    /// Files that changed while Ambition was at work.
-    dirty: BTreeSet<String>,
-    /// Files with a command written during a run.
-    mid: BTreeSet<String>,
-    /// The prompt ids of the run going now.
-    run: Option<Vec<String>>,
+const COORDINATOR_DOC: &str = "\
+# The coordinator
+
+This is where you talk to Ambition's coordinator, the thread that knows the
+others. Write a line that starts with ^ and press Ambition's key on it, as in
+any file.
+
+Threads ask it things with `ambition ask coordinator`. It can read the list of
+threads (~/.ambition/threads) and any thread's history, and pass messages
+between threads. It cannot stop or start them.
+";
+
+pub fn log(msg: &str) {
+    println!("{} {msg}", now());
 }
 
 /// One prompt on its way to the agent.
 #[derive(Clone, Debug)]
 pub struct Ask {
     pub id: String,
+    pub doc: PathBuf,
     pub rel: String,
     pub p: C::Prompt,
-    /// Where it stood in the file once the caret lines were out.
-    pub pos: usize,
+}
+
+/// A message for a thread that no press sent: a thread asking the
+/// coordinator, or the coordinator passing one on.
+struct Msg {
+    doc: PathBuf,
+    rel: String,
+    text: String,
+    reply: Option<Sender<Result<String, String>>>,
+}
+
+enum Job {
+    Press(Ask),
+    Message(Msg),
+}
+
+impl Job {
+    fn label(&self) -> String {
+        match self {
+            Job::Press(a) => a.id.clone(),
+            Job::Message(m) => format!("a message to {}", m.rel),
+        }
+    }
+
+    fn doc(&self) -> PathBuf {
+        match self {
+            Job::Press(a) => a.doc.clone(),
+            Job::Message(m) => m.doc.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Q {
+    jobs: VecDeque<Job>,
+    /// What runs in the folder now: a prompt id, a message, or a command.
+    busy: Option<String>,
+    /// Its document and, once it reached one, its thread.
+    doc: Option<PathBuf>,
+    tid: Option<String>,
+}
+
+/// A folder with presses in it: its private history and its line of turns.
+pub struct Place {
+    pub f: Folder,
+    q: Mutex<Q>,
+}
+
+/// A press on its way: waiting for its folder, or with the agent now.
+#[derive(Clone, Debug)]
+pub struct Turn {
+    pub id: String,
+    pub doc: PathBuf,
+    pub folder: PathBuf,
+    pub working: bool,
+    pub since: f64,
+    pub thread: String,
+    pub words: String,
+    pub lead: String,
+    /// The lines the agent has seen, 1-based: what `ambition more` adds to.
+    pub seen: (usize, usize),
 }
 
 pub struct App {
-    pub f: Folder,
     pub engine: Arc<dyn Engine>,
-    pub context: Context,
     pub run_limit: Duration,
-    st: Mutex<State>,
-    known: Mutex<HashMap<String, String>>,
-    told: Mutex<Vec<String>>,
-    /// Held for each of the app's own read-modify-writes of a file.
+    /// How an agent runs this Ambition: `ambition`, or the whole command
+    /// when this one is not the `ambition` on the PATH.
+    pub cli: String,
+    places: Mutex<BTreeMap<PathBuf, Arc<Place>>>,
+    turns: Mutex<Vec<Turn>>,
+    /// Held for each of Ambition's own read-modify-writes of a file.
     io: Mutex<()>,
-    kick: Mutex<Option<Sender<()>>>,
-    mid_kick: Mutex<Option<Sender<()>>>,
-    ignored: Mutex<(BTreeSet<String>, BTreeSet<String>)>,
-    /// Held while finding or making the engine's project, so it happens once.
-    project: Mutex<()>,
+    /// Held for each read-modify-write of Ambition's own files.
+    store: Mutex<()>,
+    /// One dialog at a time.
+    dialog: Mutex<()>,
+    projects: Mutex<BTreeMap<PathBuf, String>>,
 }
 
-pub fn log(msg: &str) {
-    println!("{} {msg}", now());
+pub fn load(p: &Path) -> Value {
+    std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({}))
+}
+
+pub fn save(p: &Path, v: &Value) {
+    let tmp = p.with_extension(format!("tmp{}", util::nonce()));
+    if std::fs::write(&tmp, format!("{}\n", serde_json::to_string_pretty(v).unwrap_or_default())).is_ok() {
+        let _ = std::fs::rename(&tmp, p);
+    }
+}
+
+fn own(name: &str) -> PathBuf {
+    util::state_dir().join(name)
+}
+
+/// The key a document has in `threads`.
+fn key(doc: &Path) -> String {
+    doc.to_string_lossy().to_string()
+}
+
+pub fn coordinator_doc() -> PathBuf {
+    util::state_real().join(COORDINATOR)
+}
+
+/// How an agent should run this binary.
+fn cli() -> String {
+    let exe = std::env::current_exe().ok().and_then(|p| std::fs::canonicalize(p).ok());
+    let on_path = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|d| d.join(if cfg!(windows) { "ambition.exe" } else { "ambition" }))
+            .find(|p| p.is_file())
+            .and_then(|p| std::fs::canonicalize(p).ok())
+    });
+    let quote = |s: &str| if s.contains(|c: char| c.is_whitespace() || "'\"$\\".contains(c)) { format!("'{}'", s.replace('\'', "'\\''")) } else { s.to_string() };
+    let mut s = match exe {
+        Some(e) if Some(&e) != on_path.as_ref() => quote(&e.to_string_lossy()),
+        _ => "ambition".to_string(),
+    };
+    if let Some(h) = std::env::var_os("AMBITION_HOME") {
+        s = format!("AMBITION_HOME={} {s}", quote(&h.to_string_lossy()));
+    }
+    s
 }
 
 impl App {
-    pub fn new(folder: Folder, engine: Arc<dyn Engine>) -> App {
+    pub fn new(engine: Arc<dyn Engine>) -> App {
         let run_limit = std::env::var("AMBITION_RUN_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(1800.0);
         App {
-            f: folder,
             engine,
-            context: Context::Around,
             run_limit: Duration::from_secs_f64(run_limit),
-            st: Mutex::new(State::default()),
-            known: Mutex::new(HashMap::new()),
-            told: Mutex::new(Vec::new()),
+            cli: cli(),
+            places: Mutex::new(BTreeMap::new()),
+            turns: Mutex::new(Vec::new()),
             io: Mutex::new(()),
-            kick: Mutex::new(None),
-            mid_kick: Mutex::new(None),
-            ignored: Mutex::new(Default::default()),
-            project: Mutex::new(()),
+            store: Mutex::new(()),
+            dialog: Mutex::new(()),
+            projects: Mutex::new(BTreeMap::new()),
         }
     }
 
-    /// The rules every new thread gets first, for this folder.
-    pub fn rules(&self) -> String {
-        RULES.replace("{folder}", &util::tilde(&self.f.root)).replace(ATTENTION_AROUND, self.context.attention())
-    }
-
-    // ---------- files ----------
-
-    fn read(&self, rel: &str) -> Option<String> {
-        self.f.read(rel)
-    }
-
-    /// Write a file and remember the text, so the write is not taken for a save.
-    fn write(&self, rel: &str, text: &str) {
-        self.known.lock().unwrap().insert(rel.to_string(), text.to_string());
-        self.f.write(rel, text);
-    }
-
-    // ---------- thread.json ----------
-
-    fn info(&self) -> Value {
-        load(&self.f.dot.join("thread.json"))
-    }
-
-    fn save_info(&self, v: &Value) {
-        save(&self.f.dot.join("thread.json"), v);
-    }
-
-    fn update_info(&self, f: impl FnOnce(&mut Value)) -> Value {
-        let mut v = self.info();
-        if !v.is_object() {
-            v = json!({});
-        }
-        f(&mut v);
-        self.save_info(&v);
-        v
-    }
-
-    pub fn publish(&self, changes: Value) {
-        let p = self.f.dot.join("state.json");
-        let mut d = load(&p);
-        if !d.is_object() {
-            d = json!({});
-        }
-        for (k, v) in changes.as_object().cloned().unwrap_or_default() {
-            d[k] = v;
-        }
-        d["updated"] = json!(util::epoch());
-        d["pid"] = json!(std::process::id());
-        save(&p, &d);
-    }
-
-    fn next_id(&self) -> String {
-        let v = self.update_info(|v| {
-            let n = v["n"].as_u64().unwrap_or(0) + 1;
-            v["n"] = json!(n);
-        });
-        format!("p{}", v["n"].as_u64().unwrap_or(1))
+    /// The rules every new thread gets first, for one document.
+    pub fn rules(&self, doc: &Path, folder: &Path) -> String {
+        RULES.replace("{document}", &util::tilde(doc)).replace("{folder}", &util::tilde(folder))
     }
 
     // ---------- starting ----------
 
-    /// Everything before the first save: the hidden folder, the history,
-    /// carets left from before, and the engine's project and models.
+    /// Everything before the first press: Ambition's folder, prompts a stop
+    /// cut off, and the engine's models.
     pub fn start(self: &Arc<Self>) -> Result<(), String> {
-        self.f.init()?;
-        let readme = self.f.path(COMMANDS).join("README.md");
+        let home = util::state_dir();
+        std::fs::create_dir_all(&home).map_err(|e| format!("cannot make {}: {e}", home.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+        }
+        self.restore();
+        let coord = home.join(COORDINATOR);
+        if !coord.exists() {
+            let _ = std::fs::write(&coord, COORDINATOR_DOC);
+        }
+        let readme = Cm::dir().join("README.md");
         if !readme.exists() {
-            let _ = std::fs::create_dir_all(self.f.path(COMMANDS));
+            let _ = std::fs::create_dir_all(Cm::dir());
             let _ = std::fs::write(&readme, Cm::README);
         }
-        self.clear_stale();
-        let files = self.f.files();
-        {
-            let mut known = self.known.lock().unwrap();
-            let mut st = self.st.lock().unwrap();
-            for rel in &files {
-                if let Some(t) = self.read(rel) {
-                    if t.contains('^') {
-                        st.carets.insert(rel.clone());
-                    }
-                    known.insert(rel.clone(), t);
-                }
-            }
-        }
-        self.publish(json!({"run": null}));
+        self.publish();
         let me = self.clone();
-        std::thread::spawn(move || me.start_engine());
+        std::thread::spawn(move || match me.refresh_models() {
+            Ok(m) => log(&format!("{}: {} models", me.engine.name(), m.len())),
+            Err(e) => log(&format!("{} is not ready: {e}", me.engine.name())),
+        });
         Ok(())
     }
 
-    fn start_engine(&self) {
-        match self.project_id() {
-            Ok(pid) => {
-                let models = self.refresh_models().map(|m| m.len()).unwrap_or(0);
-                let label = self.label(self.current().as_ref());
-                let v = self.update_info(|v| v["model"] = json!(label));
-                self.publish(json!({"thread": v["link"], "model": label}));
-                log(&format!("{}: project {pid}, {models} models, thread {}", self.engine.name(),
-                    v["threadId"].as_str().unwrap_or("none yet")));
-            }
-            Err(e) => log(&format!("{} is not ready: {e}", self.engine.name())),
-        }
-    }
-
-    /// Status lines left by a run that never finished (a crash, a restart).
-    fn clear_stale(&self) {
-        for rel in self.f.files() {
-            let Some(text) = self.read(&rel) else { continue };
-            if !text.contains(C::WORKING) {
-                continue;
-            }
-            let st = C::statuses(&rel, &text);
-            if st.is_empty() {
-                continue;
-            }
-            let mut lines: Vec<Option<String>> = text.split('\n').map(|l| Some(l.to_string())).collect();
-            for (pid, i) in st {
-                let lead = C::caret_at(&rel, lines[i].as_deref().unwrap_or("")).map(|a| lines[i].as_ref().unwrap()[..a].to_string()).unwrap_or_default();
-                lines[i] = if pid.contains('.') {
-                    None
-                } else {
-                    Some(format!("{lead}^> {pid} was cut off when Ambition stopped. Its prompt is in {HISTORY}; write it again to run it."))
-                };
-            }
-            let out: Vec<String> = lines.into_iter().flatten().collect();
-            self.write(&rel, &out.join("\n"));
-        }
-    }
-
-    // ---------- watching ----------
-
-    /// The watcher calls this with every path the operating system reports.
-    pub fn changed(self: &Arc<Self>, paths: Vec<PathBuf>) {
-        let mut candidates = BTreeSet::new();
-        for p in paths {
-            // When the system drops events, it names the folder itself: look at everything.
-            if p == self.f.root || std::fs::canonicalize(&p).is_ok_and(|c| c == self.f.root) {
-                candidates.extend(self.f.files());
-                continue;
-            }
-            let Some(rel) = self.rel_of(&p) else { continue };
-            if rel == ".ambition" || rel.starts_with(".ambition/") || rel.split('/').any(|x| x.starts_with('.')) {
-                continue;
-            }
-            if p.is_dir() {
-                for f in walk(&p) {
-                    if let Some(r) = self.rel_of(&f) {
-                        candidates.insert(r);
-                    }
-                }
-            } else {
-                candidates.insert(rel);
-            }
-        }
-        if candidates.is_empty() {
+    /// Prompts whose turn a stop cut off go back where they were, so a press
+    /// sends them again.
+    fn restore(&self) {
+        let d = load(&own("state.json"));
+        if d["pid"].as_u64() == Some(std::process::id() as u64) {
             return;
         }
-        let unknown: Vec<String> = {
-            let known = self.known.lock().unwrap();
-            candidates.iter().filter(|r| !known.contains_key(*r) && self.f.path(r).exists()).cloned().collect()
+        for t in d["turns"].as_array().into_iter().flatten() {
+            let (Some(doc), Some(id)) = (t["doc"].as_str(), t["id"].as_str()) else { continue };
+            let doc = PathBuf::from(doc);
+            let rel = doc.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let Ok(text) = std::fs::read_to_string(&doc) else { continue };
+            if !C::statuses(&rel, &text).contains_key(id) {
+                continue;
+            }
+            let lead = t["lead"].as_str().unwrap_or("");
+            let mut new: Vec<String> = t["words"].as_str().unwrap_or("").split('\n').map(|w| format!("{lead}^ {w}")).collect();
+            new.push(format!("{lead}^> {id} was cut off when Ambition stopped. Press its line again to send it."));
+            let _ = std::fs::write(&doc, C::replace_status(&rel, &text, id, &new));
+            log(&format!("{id} in {} was cut off: its prompt is back", util::tilde(&doc)));
+        }
+    }
+
+    /// Answer one inbox request.
+    pub fn handle(self: &Arc<Self>, req: &Value) -> Value {
+        let cwd = req["cwd"].as_str().map(PathBuf::from).and_then(|p| std::fs::canonicalize(p).ok());
+        let r = match req["op"].as_str().unwrap_or("") {
+            "press" => match (req["file"].as_str(), req["line"].as_u64()) {
+                (Some(f), Some(l)) => self.press(f, l as usize),
+                _ => Err("a press names a file and a line".into()),
+            },
+            "more" => {
+                let up = req["dir"].as_str() != Some("down");
+                let n = req["n"].as_u64().map(|n| n as usize).unwrap_or(hook::MORE).max(1);
+                self.more(up, n, cwd.as_deref())
+            }
+            "ask" => self.ask(req["to"].as_str().unwrap_or(""), req["message"].as_str().unwrap_or(""), cwd.as_deref()),
+            "ping" => Ok(format!("ambition {}", env!("CARGO_PKG_VERSION"))),
+            other => Err(format!("Ambition has no request “{other}”")),
         };
-        let ignored = self.ignored(&unknown);
-        let mut save = false;
-        let mut mid = false;
-        for rel in candidates {
-            if ignored.contains(&rel) {
-                continue;
-            }
-            let exists = self.f.path(&rel).exists();
-            if !exists {
-                let was = self.known.lock().unwrap().remove(&rel).is_some();
-                if was {
-                    let mut st = self.st.lock().unwrap();
-                    if st.working {
-                        st.dirty.insert(rel);
-                    }
-                }
-                continue;
-            }
-            if !self.f.watchable(&rel) {
-                continue;
-            }
-            let Some(text) = self.read(&rel) else { continue };
-            let mut known = self.known.lock().unwrap();
-            if known.get(&rel) == Some(&text) {
-                continue;
-            }
-            let mut st = self.st.lock().unwrap();
-            if st.working {
-                // The app at work, the agent's own edit, or a save during a run.
-                // Prompts wait for the run to end; a command runs now.
-                st.dirty.insert(rel.clone());
-                if st.run.is_some() && text.contains("^/") && !C::commands(&rel, &text).is_empty() {
-                    st.mid.insert(rel.clone());
-                    mid = true;
-                }
-                continue;
-            }
-            known.insert(rel.clone(), text.clone());
-            st.saved.insert(rel.clone());
-            if text.contains('^') {
-                st.carets.insert(rel.clone());
-            }
-            save = true;
-        }
-        if save {
-            if let Some(k) = self.kick.lock().unwrap().as_ref() {
-                let _ = k.send(());
-            }
-        }
-        if mid {
-            if let Some(k) = self.mid_kick.lock().unwrap().as_ref() {
-                let _ = k.send(());
-            }
+        match r {
+            Ok(t) => inbox::ok(t),
+            Err(e) => inbox::no(e),
         }
     }
 
-    fn rel_of(&self, p: &std::path::Path) -> Option<String> {
-        let rel = p.strip_prefix(&self.f.root).ok().map(|r| r.to_path_buf()).or_else(|| {
-            let c = std::fs::canonicalize(p).ok()?;
-            c.strip_prefix(&self.f.root).ok().map(|r| r.to_path_buf())
-        })?;
-        let s = rel.to_string_lossy().replace('\\', "/");
-        (!s.is_empty()).then_some(s)
+    // ---------- Ambition's own files ----------
+
+    fn entry(&self, doc: &Path) -> Value {
+        load(&own("threads"))[key(doc)].clone()
     }
 
-    /// Which of these new paths the folder's .gitignore files hide. Folders
-    /// are asked about once and remembered, so a build writing thousands of
-    /// ignored files costs one question per folder.
-    fn ignored(&self, rels: &[String]) -> BTreeSet<String> {
-        let mut out = BTreeSet::new();
-        if rels.is_empty() {
-            return out;
+    fn update_entry(&self, doc: &Path, f: impl FnOnce(&mut Value)) {
+        let _g = self.store.lock().unwrap();
+        let p = own("threads");
+        let mut all = load(&p);
+        let mut v = all[key(doc)].clone();
+        if !v.is_object() {
+            v = json!({});
         }
-        let mut ask: BTreeSet<String> = BTreeSet::new();
+        f(&mut v);
+        all[key(doc)] = v;
+        save(&p, &all);
+    }
+
+    /// What is on its way now, for the language server and for a restart.
+    fn publish(&self) {
+        let rows: Vec<Value> = self.turns.lock().unwrap().iter().map(|t| json!({
+            "id": t.id, "doc": key(&t.doc), "folder": key(&t.folder), "state": if t.working { "working" } else { "waiting" },
+            "since": t.since, "thread": t.thread, "words": t.words, "lead": t.lead})).collect();
+        let _g = self.store.lock().unwrap();
+        let p = own("state.json");
+        let mut d = load(&p);
+        d["pid"] = json!(std::process::id());
+        d["updated"] = json!(util::epoch());
+        d["turns"] = json!(rows);
+        save(&p, &d);
+    }
+
+    fn next_id(&self) -> String {
+        let _g = self.store.lock().unwrap();
+        let p = own("state.json");
+        let mut d = load(&p);
+        let n = d["n"].as_u64().unwrap_or(0) + 1;
+        d["n"] = json!(n);
+        save(&p, &d);
+        format!("p{n}")
+    }
+
+    fn set_turn(&self, id: &str, f: impl FnOnce(&mut Turn)) {
+        if let Some(t) = self.turns.lock().unwrap().iter_mut().find(|t| t.id == id) {
+            f(t);
+        }
+    }
+
+    // ---------- folders ----------
+
+    fn place(&self, root: &Path) -> Result<Arc<Place>, String> {
+        let mut m = self.places.lock().unwrap();
+        if let Some(p) = m.get(root) {
+            return Ok(p.clone());
+        }
+        let f = Folder::new(root);
+        f.init()?;
+        let p = Arc::new(Place { f, q: Mutex::new(Q::default()) });
+        m.insert(root.to_path_buf(), p.clone());
+        Ok(p)
+    }
+
+    /// Ask for a grant: a dialog on macOS, else `ambition allow`.
+    fn grant(&self, doc: &Path, root: &Path) -> Result<(), String> {
+        let how = format!("To let presses there run without asking: ambition allow {}", util::tilde(root));
+        if config::too_wide(root) {
+            return Err(format!("{} is your whole home folder or a disk, which Ambition does not grant. Move the file into a \
+                folder, or allow one: ambition allow <folder>.", util::tilde(root)));
+        }
+        let _one = self.dialog.lock().unwrap();
+        if config::place(doc).1 {
+            return Ok(()); // the dialog before this one granted it
+        }
+        if !cfg!(target_os = "macos") {
+            return Err(format!("{} is not allowed yet, so nothing was sent. {how}", util::tilde(root)));
+        }
+        let text = format!("A press in {} would send its ^ line to an agent with a shell, working in {}.\n\n\
+            Always lets every press in that folder run without asking.", util::tilde(doc), util::tilde(root));
+        let out = std::process::Command::new("osascript")
+            .args(["-e", "on run argv", "-e",
+                "display dialog (item 1 of argv) with title \"Ambition\" buttons {\"Deny\", \"Allow once\", \"Always\"} \
+                 default button \"Allow once\" cancel button \"Deny\" giving up after 120 with icon caution",
+                "-e", "end run", &text])
+            .output();
+        let out = match out {
+            Ok(o) => o,
+            Err(e) => return Err(format!("could not ask (osascript: {e}), so nothing was sent. {how}")),
+        };
+        let said = String::from_utf8_lossy(&out.stdout).to_string();
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        if said.contains("gave up:true") {
+            return Err("nobody answered the dialog, so nothing was sent.".into());
+        }
+        if said.contains("button returned:Always") {
+            config::allow(root)?;
+            log(&format!("granted {}", util::tilde(root)));
+            return Ok(());
+        }
+        if said.contains("button returned:Allow once") {
+            return Ok(());
+        }
+        if err.contains("-128") || said.contains("button returned:Deny") {
+            return Err(format!("denied: nothing was sent from {}.", util::tilde(root)));
+        }
+        Err(format!("could not ask ({}), so nothing was sent. {how}", err.trim()))
+    }
+
+    // ---------- a press ----------
+
+    /// A press on `line` (1-based) of `file`.
+    pub fn press(self: &Arc<Self>, file: &str, line: usize) -> Result<String, String> {
+        let doc = std::fs::canonicalize(file).map_err(|_| format!("{file}: no such file."))?;
+        let meta = std::fs::metadata(&doc).map_err(|e| e.to_string())?;
+        if !meta.is_file() {
+            return Err(format!("{} is not a file.", util::tilde(&doc)));
+        }
+        if meta.len() > folder::MAX_BYTES || !folder::is_text(&doc) {
+            return Err(format!("{} is not a text file of up to 512 KB, so Ambition does not read it.", util::tilde(&doc)));
+        }
+        let text = std::fs::read_to_string(&doc).map_err(|e| e.to_string())?;
+        let name = doc.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let lines: Vec<&str> = text.split('\n').collect();
+        let n = hook::lines(&text).len();
+        if line == 0 || line > n.max(1) {
+            return Err(format!("{name} has {n} lines, so there is no line {line} to send."));
+        }
+        let command = match C::kind(&name, lines[line - 1]) {
+            Some((_, C::Kind::Prompt(_))) => None,
+            Some((_, C::Kind::Command { name: c, .. })) => Some(c),
+            Some((_, C::Kind::Status(id))) => return Err(format!("{id} is on its way already. Its status line goes when its turn ends.")),
+            Some((_, C::Kind::Reply)) => return Err(format!("line {line} is a reply (^>), not a prompt. The next press in {name} clears it.")),
+            Some((_, C::Kind::Other)) => return Err(format!("line {line} has a ^ with nothing after it to send.")),
+            None => return Err(format!("line {line} of {name} does not start with ^, so there is nothing to send. Press on a ^ line.")),
+        };
+        let (root, allowed) = config::place(&doc);
+        if !allowed {
+            self.grant(&doc, &root)?;
+        }
+        let place = self.place(&root)?;
+        let rel = place.f.rel(&doc).unwrap_or(name);
+        match command {
+            None => self.prompt_press(&place, &doc, &rel, line - 1),
+            Some(c) => self.command_press(&place, &doc, &rel, line - 1, &c),
+        }
+    }
+
+    fn prompt_press(self: &Arc<Self>, place: &Arc<Place>, doc: &Path, rel: &str, i: usize) -> Result<String, String> {
+        let mut q = place.q.lock().unwrap();
+        let io = self.io.lock().unwrap();
+        let text = place.f.read(rel).unwrap_or_default();
+        let Some(p) = C::prompts(rel, &text).into_iter().find(|p| p.start <= i && i < p.end) else {
+            return Err("the prompt changed while it was pressed; press it again.".into());
+        };
+        let id = self.next_id();
+        let ahead = q.busy.clone();
+        let state = match &ahead {
+            Some(a) => format!("waiting for {a}"),
+            None => "working".into(),
+        };
+        let (cleared, gone) = C::clear_replies(rel, &text, true);
+        let start = diff::remap(&text, &cleared, p.start);
+        let (stripped, pos) = C::remove(&cleared, &[(start, start + (p.end - p.start))]);
+        let status = C::status_line(&p.lead, &id, &format!("{} · {state}", util::cut(&p.text, 48)));
+        place.f.write(rel, &C::insert(&stripped, pos[0], &[status]));
+        drop(io);
+        if !gone.is_empty() {
+            place.f.history(&format!("## {} · {rel} · cleared\n{}", now(), gone.join("\n")));
+        }
+        let words: Vec<String> = p.text.split('\n').map(|l| format!("^ {l}")).collect();
+        place.f.history(&format!("## {} · {rel} · {id} · asked\n{}", now(), words.join("\n")));
+        self.turns.lock().unwrap().push(Turn {
+            id: id.clone(), doc: doc.to_path_buf(), folder: place.f.root.clone(), working: ahead.is_none(), since: util::epoch(),
+            thread: String::new(), words: p.text.clone(), lead: p.lead.clone(), seen: (0, 0),
+        });
+        q.jobs.push_back(Job::Press(Ask { id: id.clone(), doc: doc.to_path_buf(), rel: rel.to_string(), p }));
+        let go = q.busy.is_none();
+        if go {
+            q.busy = Some(id.clone());
+        }
+        drop(q);
+        self.publish();
+        if go {
+            self.spawn(place);
+        }
+        Ok(match ahead {
+            Some(a) => format!("{id} waits for {a}: one turn at a time runs in {}.", util::tilde(&place.f.root)),
+            None => format!("{id} sent to the thread for {rel}."),
+        })
+    }
+
+    fn command_press(self: &Arc<Self>, place: &Arc<Place>, doc: &Path, rel: &str, i: usize, name: &str) -> Result<String, String> {
+        // A free folder is held while the command runs, so no turn starts
+        // meanwhile and its change is one commit that ^/undo can take back.
+        let held = {
+            let mut q = place.q.lock().unwrap();
+            let free = q.busy.is_none() && q.jobs.is_empty();
+            if free {
+                q.busy = Some(format!("^/{name}"));
+                q.doc = Some(doc.to_path_buf());
+            }
+            free
+        };
+        let found = {
+            let _io = self.io.lock().unwrap();
+            let text = place.f.read(rel).unwrap_or_default();
+            C::commands(rel, &text).into_iter().find(|c| c.line == i).map(|c| {
+                let (cleared, _) = C::clear_replies(rel, &text, true);
+                let at = diff::remap(&text, &cleared, i);
+                let (stripped, pos) = C::remove(&cleared, &[(at, at + 1)]);
+                place.f.write(rel, &stripped);
+                if held {
+                    place.f.commit(&format!("Ambition: pressed ^/{name} in {rel}"));
+                }
+                (c, stripped, pos[0])
+            })
+        };
+        let Some((c, stripped, at)) = found else {
+            if held {
+                self.release(place);
+            }
+            return Err("the command changed while it was pressed; press it again.".into());
+        };
+        let reply = self.run_command(&c, place, doc, rel, &unit_above(rel, &stripped, at), held);
         {
-            let (ign, ok) = &*self.ignored.lock().unwrap();
-            for rel in rels {
-                let parts: Vec<&str> = rel.split('/').collect();
-                let mut hidden = false;
-                for k in 1..parts.len() {
-                    let dir = format!("{}/", parts[..k].join("/"));
-                    if ign.contains(&dir) {
-                        hidden = true;
-                        break;
-                    }
-                    if !ok.contains(&dir) {
-                        ask.insert(dir);
-                    }
-                }
-                if hidden {
-                    out.insert(rel.clone());
-                } else {
-                    ask.insert(rel.clone());
-                }
-            }
+            let _io = self.io.lock().unwrap();
+            let text = place.f.read(rel).unwrap_or_default();
+            let here = diff::remap(&stripped, &text, at);
+            place.f.write(rel, &C::insert(&text, here, &C::reply_lines(&c.lead, &reply, 12)));
         }
-        if ask.is_empty() {
-            return out;
+        let line = format!("^/{} {}", c.name, c.args);
+        place.f.history(&format!("## {} · {rel} · ^/{} · command\n{}\n{}", now(), c.name, line.trim_end(),
+            C::reply_lines("", &reply, usize::MAX).join("\n")));
+        if held {
+            place.f.commit(&format!("Ambition: command /{} in {rel}", c.name));
+            self.release(place);
         }
-        let list: Vec<String> = ask.iter().cloned().collect();
-        let res = self.f.git_in(&["check-ignore", "-z", "--stdin", "--no-index"], Some(list.join("\0").as_bytes()));
-        let hit: BTreeSet<String> = res.stdout.split(|&b| b == 0).filter_map(|s| std::str::from_utf8(s).ok()).filter(|s| !s.is_empty())
-            .map(str::to_string).collect();
-        let (ign, ok) = &mut *self.ignored.lock().unwrap();
-        for a in &list {
-            if a.ends_with('/') {
-                if hit.contains(a) || hit.contains(a.trim_end_matches('/')) {
-                    ign.insert(a.clone());
-                } else {
-                    ok.insert(a.clone());
-                }
-            }
-        }
-        for rel in rels {
-            let parts: Vec<&str> = rel.split('/').collect();
-            let under = (1..parts.len()).any(|k| ign.contains(&format!("{}/", parts[..k].join("/"))));
-            if under || hit.contains(rel) {
-                out.insert(rel.clone());
-            }
-        }
-        out
+        Ok(reply)
     }
 
-    /// The responder: waits for saves, lets them settle, and answers them,
-    /// one pass at a time.
-    pub fn serve(self: &Arc<Self>) {
-        let (tx, rx) = channel();
-        *self.kick.lock().unwrap() = Some(tx.clone());
-        let (mtx, mrx) = channel();
-        *self.mid_kick.lock().unwrap() = Some(mtx);
-        let me = self.clone();
-        std::thread::spawn(move || me.commander(mrx));
-        if !self.st.lock().unwrap().carets.is_empty() {
-            let _ = tx.send(());
+    // ---------- the folder's line ----------
+
+    fn spawn(self: &Arc<Self>, place: &Arc<Place>) {
+        let (me, p) = (self.clone(), place.clone());
+        std::thread::spawn(move || me.work(p));
+    }
+
+    fn release(self: &Arc<Self>, place: &Arc<Place>) {
+        let mut q = place.q.lock().unwrap();
+        q.busy = None;
+        q.doc = None;
+        if let Some(j) = q.jobs.front() {
+            q.busy = Some(j.label());
+            drop(q);
+            self.spawn(place);
         }
+    }
+
+    fn enqueue(self: &Arc<Self>, place: &Arc<Place>, job: Job) {
+        let mut q = place.q.lock().unwrap();
+        let label = job.label();
+        q.jobs.push_back(job);
+        if q.busy.is_none() {
+            q.busy = Some(label);
+            drop(q);
+            self.spawn(place);
+        }
+    }
+
+    /// The folder's turns, one at a time, until its line is empty.
+    fn work(self: Arc<Self>, place: Arc<Place>) {
         loop {
-            if rx.recv().is_err() {
-                return;
-            }
-            settle(&rx);
-            self.st.lock().unwrap().working = true;
-            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.handle())) {
-                log(&format!("a save failed: {e:?}"));
-            }
-            // What changed while it worked: the agent's edits are not saves, but
-            // carets written meanwhile run next.
-            let dirty: Vec<String> = {
-                let mut st = self.st.lock().unwrap();
-                st.run = None;
-                std::mem::take(&mut st.dirty).into_iter().collect()
-            };
-            let mut again = false;
-            {
-                let mut known = self.known.lock().unwrap();
-                let mut st = self.st.lock().unwrap();
-                for rel in dirty {
-                    match self.read(&rel) {
-                        Some(t) => {
-                            if !C::prompts(&rel, &t).is_empty() || !C::commands(&rel, &t).is_empty() {
-                                st.carets.insert(rel.clone());
-                                again = true;
-                            }
-                            known.insert(rel, t);
-                        }
-                        None => {
-                            known.remove(&rel);
-                        }
+            let job = {
+                let mut q = place.q.lock().unwrap();
+                match q.jobs.pop_front() {
+                    Some(j) => {
+                        q.busy = Some(j.label());
+                        q.doc = Some(j.doc());
+                        q.tid = None;
+                        j
+                    }
+                    None => {
+                        q.busy = None;
+                        q.doc = None;
+                        q.tid = None;
+                        return;
                     }
                 }
-                st.working = false;
+            };
+            let id = job.label();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job {
+                Job::Press(a) => self.turn(&place, a),
+                Job::Message(m) => self.message_turn(&place, m),
+            }));
+            if let Err(e) = r {
+                log(&format!("{id} failed: {e:?}"));
             }
-            self.publish(json!({"run": null}));
-            if again {
-                let _ = tx.send(());
-            }
+            self.turns.lock().unwrap().retain(|t| t.id != id);
+            self.publish();
         }
     }
 
-    fn commander(&self, rx: Receiver<()>) {
-        while rx.recv().is_ok() {
-            if self.st.lock().unwrap().run.is_some() {
-                self.mid_run_commands();
+    // ---------- a turn ----------
+
+    fn turn(&self, place: &Place, a: Ask) {
+        let f = &place.f;
+        let working = C::status_line(&a.p.lead, &a.id, &format!("{} · working", util::cut(&a.p.text, 48)));
+        // The folder as it is, without this status line, is one commit: the
+        // writer's own typing, which ^/undo of the turn leaves alone.
+        let started = {
+            let _io = self.io.lock().unwrap();
+            let text = f.read(&a.rel).unwrap_or_default();
+            match C::statuses(&a.rel, &text).get(&a.id).copied() {
+                None => None,
+                Some(i) => {
+                    let mut lines: Vec<&str> = text.split('\n').collect();
+                    lines.remove(i);
+                    let t0 = lines.join("\n");
+                    f.write(&a.rel, &t0);
+                    f.commit(&format!("Ambition: pressed {} in {}", a.id, a.rel));
+                    let t1 = C::insert(&t0, i, &[working]);
+                    f.write(&a.rel, &t1);
+                    Some((i, t1))
+                }
             }
-        }
-    }
-
-    // ---------- one save ----------
-
-    pub fn handle(&self) {
-        let (saved, maybe) = {
-            let mut st = self.st.lock().unwrap();
-            (std::mem::take(&mut st.saved), std::mem::take(&mut st.carets))
         };
-        let guard = self.io.lock().unwrap();
-        for rel in &saved {
-            let Some(text) = self.read(rel) else { continue };
-            let (new, gone) = C::clear_replies(rel, &text, true);
-            if !gone.is_empty() {
-                self.write(rel, &new);
-                self.f.history(&format!("## {} · {rel} · cleared\n{}", now(), gone.join("\n")));
-            }
-        }
-        // Every caret waiting in the files that may hold one.
-        let mut waiting: Vec<(String, C::Prompt)> = Vec::new();
-        let mut cmds: BTreeMap<String, Vec<C::Command>> = BTreeMap::new();
-        for rel in saved.union(&maybe) {
-            let Some(text) = self.read(rel) else { continue };
-            if !text.contains('^') {
-                continue;
-            }
-            waiting.extend(C::prompts(rel, &text).into_iter().map(|p| (rel.clone(), p)));
-            let c = C::commands(rel, &text);
-            if !c.is_empty() {
-                cmds.insert(rel.clone(), c);
-            }
-        }
-        if waiting.is_empty() && cmds.is_empty() {
+        let Some((i, start)) = started else {
+            f.history(&format!("## {} · {} · {} · dropped\nIts status line was gone when its turn came, so nothing was sent.", now(), a.rel, a.id));
             return;
-        }
-        let mut asks: Vec<Ask> = waiting.into_iter().map(|(rel, p)| Ask { id: self.next_id(), rel, p, pos: 0 }).collect();
-        for a in &asks {
-            let words: Vec<String> = a.p.text.split('\n').map(|l| format!("^ {l}")).collect();
-            self.f.history(&format!("## {} · {} · {} · asked\n{}", now(), a.rel, a.id, words.join("\n")));
-        }
+        };
+        self.set_turn(&a.id, |t| {
+            t.working = true;
+            t.since = util::epoch();
+        });
+        self.publish();
 
-        // Take every caret line out, and note where each stood.
-        let files: BTreeSet<String> = asks.iter().map(|a| a.rel.clone()).chain(cmds.keys().cloned()).collect();
-        let mut at: BTreeMap<(String, usize), usize> = BTreeMap::new();
-        // Each file as it was once its carets were out: positions count from it.
-        let mut clean: BTreeMap<String, String> = BTreeMap::new();
-        for rel in &files {
-            let text = self.read(rel).unwrap_or_default();
-            let mine: Vec<usize> = (0..asks.len()).filter(|&k| asks[k].rel == *rel).collect();
-            let mut ranges: Vec<(usize, usize)> = mine.iter().map(|&k| (asks[k].p.start, asks[k].p.end)).collect();
-            let cs = cmds.get(rel).cloned().unwrap_or_default();
-            ranges.extend(cs.iter().map(|c| (c.line, c.line + 1)));
-            let (stripped, pos) = C::remove(&text, &ranges);
-            for (n, &k) in mine.iter().enumerate() {
-                asks[k].pos = pos[n];
+        let since = match self.entry(&a.doc)["last"].as_str() {
+            None => Since::First,
+            Some(last) => {
+                let old = f.show(last, &a.rel).unwrap_or_default();
+                let new = f.show("HEAD", &a.rel).unwrap_or_default();
+                hook::changes(&a.rel, &old, &new).map(Since::Diff).unwrap_or(Since::Nothing)
             }
-            for (n, c) in cs.iter().enumerate() {
-                at.insert((rel.clone(), c.line), pos[mine.len() + n]); // where its reply goes
-            }
-            self.write(rel, &stripped);
-            clean.insert(rel.clone(), stripped);
-        }
-        let names = files.iter().cloned().collect::<Vec<_>>().join(", ");
-        let base = self.f.head();
-        let saved_as = self.f.commit(&format!("Ambition: saved {names}"));
-        let typed = if saved_as.is_empty() { (String::new(), String::new()) } else { (saved_as.clone(), self.saved_diff(&base)) };
+        };
+        let (msg, seen) = hook::press(&util::tilde(&a.doc), &a.id, &a.p.text, &start, i, &since, &self.cli);
+        self.set_turn(&a.id, |t| t.seen = seen);
 
-        // Commands, at once. Undo first, while the tree is clean.
-        let mut order: Vec<(String, C::Command, usize)> = cmds.iter()
-            .flat_map(|(r, cs)| cs.iter().map(|c| (r.clone(), c.clone(), at[&(r.clone(), c.line)])))
-            .collect();
-        order.sort_by_key(|(r, c, _)| (c.name != "undo", r.clone(), c.line));
-        let replies = self.do_commands(&order, &clean, false);
-
-        // A status line where each prompt stood, and the commands' replies. A
-        // command such as ^/undo may have changed the file: every position
-        // moves with the text it was next to.
-        for rel in &files {
-            let mut text = self.read(rel).unwrap_or_default();
-            let was = clean.get(rel).cloned().unwrap_or_default();
-            let mut adds: Vec<(usize, u8, usize, Vec<String>)> = replies.get(rel).cloned().unwrap_or_default()
-                .into_iter().map(|(at, line, lines)| (diff::remap(&was, &text, at), 0, line, lines)).collect();
-            for a in asks.iter_mut().filter(|a| a.rel == *rel) {
-                a.pos = diff::remap(&was, &text, a.pos);
-                adds.push((a.pos, 2, a.p.start, vec![C::status_line(&a.p.lead, &a.id, &format!("{} · working", util::cut(&a.p.text, 48)))]));
-            }
-            adds.sort_by_key(|x| (x.0, x.1, x.2));
-            for (at, _, _, lines) in adds.into_iter().rev() {
-                text = C::insert(&text, at, &lines);
-            }
-            self.write(rel, &text);
-        }
-        if asks.is_empty() {
-            let what: Vec<String> = order.iter().map(|(_, c, _)| format!("/{}", c.name)).collect();
-            self.f.commit(&format!("Ambition: command {} in {names}", what.join(", ")));
-            return;
-        }
-        // What the files look like as the agent starts, to see what its turn did.
-        let before: BTreeMap<String, String> = files.iter().filter_map(|r| self.read(r).map(|t| (r.clone(), t))).collect();
-        self.st.lock().unwrap().run = Some(asks.iter().map(|a| a.id.clone()).collect());
-        drop(guard);
-
-        // The agent, outside the file lock, so commands written meanwhile still run.
-        let msg = self.message(&asks, &typed);
-        self.told.lock().unwrap().clear();
         let (mut tid, mut link, mut run, mut status, mut err) = (String::new(), String::new(), String::new(), Status::Failed, String::new());
-        match self.ask_agent(&msg, &asks) {
+        match self.ask_agent(place, &a.doc, &a.rel, &msg, true, Some(&a.id)) {
             Ok((t, l, r, s)) => (tid, link, run, status) = (t, l, r, s),
             Err(e) => {
                 log(&format!("{}: {e}", self.engine.name()));
                 err = e;
             }
         }
-        self.mid_run_commands();
-
-        let _guard = self.io.lock().unwrap();
         let said = if !tid.is_empty() && !run.is_empty() && status == Status::Completed {
             self.engine.reply(&tid, &run).unwrap_or_default().trim().to_string()
         } else {
             String::new()
         };
-        let dirty: BTreeSet<String> = self.st.lock().unwrap().dirty.clone();
-        let touched: BTreeSet<String> = dirty.union(&files).cloned().collect();
-        let then = |rel: &str| before.get(rel).cloned().or_else(|| self.f.show("HEAD", rel));
-        let changed = touched.iter().any(|r| self.read(r) != then(r));
-        let new_replies = touched.iter().any(|r| {
-            let was: BTreeSet<String> = C::replies(r, &then(r).unwrap_or_default()).into_iter().collect();
-            C::replies(r, &self.read(r).unwrap_or_default()).into_iter().any(|l| !was.contains(&l))
-        });
-        for (k, a) in asks.iter().enumerate() {
-            let mut text = self.read(&a.rel).unwrap_or_default();
-            let note = if !err.is_empty() {
-                Some(format!("{} did not reach the agent: {err}", a.id))
-            } else {
-                match &status {
-                    Status::Completed => None,
-                    Status::NeedsInput => Some(format!("{} is waiting for your answer in {}: {link}", a.id, self.engine.name())),
-                    Status::Running => Some(format!("{} is still working after {} minutes: {link}. ^/stop stops it.", a.id,
-                        self.run_limit.as_secs() / 60)),
-                    Status::Interrupted => Some(format!("{} was stopped before it finished. {link}", a.id)),
-                    s => Some(format!("{}: the agent's turn ended as {}. {link}", a.id, s.word())),
-                }
-            };
-            if let Some(n) = note {
-                text = C::replace_status(&a.rel, &text, &a.id, &C::reply_lines(&a.p.lead, &n, 12));
-            } else if k == 0 && !said.is_empty() && !new_replies {
-                // The answer is in the thread but not in the file. The rules have
-                // the agent end its turn by repeating its ^> lines; when those
-                // never reached the file, they go where the prompt stood. With no
-                // ^> lines, the last message counts only when the turn changed
-                // no file at all.
-                let marked: Vec<String> = said.split('\n').filter(|l| l.trim_start().starts_with("^>"))
-                    .map(|l| l.trim_start()[2..].strip_prefix(' ').unwrap_or(&l.trim_start()[2..]).to_string()).collect();
-                let body = if !marked.is_empty() {
-                    marked.join("\n")
-                } else if !changed {
-                    said.split('\n').map(|l| {
-                        let t = l.trim_start();
-                        t.strip_prefix("^>").map(|r| r.strip_prefix(' ').unwrap_or(r).to_string()).unwrap_or_else(|| l.to_string())
-                    }).collect::<Vec<_>>().join("\n")
-                } else {
-                    String::new()
-                };
-                if !body.trim().is_empty() {
-                    text = C::replace_status(&a.rel, &text, &a.id, &C::reply_lines(&a.p.lead, &body, 12));
-                }
-            }
-            self.write(&a.rel, &C::remove_marks(&a.rel, &text, &a.id));
-            let reps = C::replies(&a.rel, &self.read(&a.rel).unwrap_or_default());
-            self.f.history(&format!("## {} · {} · {} · agent ({}){}{}", now(), a.rel, a.id, status.word(),
-                if link.is_empty() { String::new() } else { format!("\nThread: {link}") },
-                if reps.is_empty() { String::new() } else { format!("\nReplies in the file now:\n{}", reps.join("\n")) }));
-        }
-        let rels: BTreeSet<&str> = asks.iter().map(|a| a.rel.as_str()).collect();
-        let ids: Vec<&str> = asks.iter().map(|a| a.id.as_str()).collect();
-        self.f.commit(&format!("Ambition: agent answered {} in {}: {}", ids.join(", "), rels.into_iter().collect::<Vec<_>>().join(", "),
-            util::cut(&asks[0].p.text, 70)));
-        log(&format!("answered {} ({})", ids.join(", "), status.word()));
-    }
 
-    /// What the save just committed changed since `base`: the writer's own
-    /// typing, as text for the agent. The carets are already out of it. Reply
-    /// lines, the history, and changes that are only blank lines are left out.
-    fn saved_diff(&self, base: &str) -> String {
-        if base.is_empty() {
-            return String::new();
-        }
-        let mut out: Vec<String> = Vec::new();
-        for (st, rel) in self.f.changed_between(base, "HEAD") {
-            if rel == HISTORY {
-                continue;
-            }
-            let (old, new) = (self.f.show(base, &rel), self.f.show("HEAD", &rel));
-            match (old, new) {
-                (_, None) if st.starts_with('D') => {
-                    out.push(format!("{rel}: deleted"));
-                }
-                (None, Some(new)) => out.push(format!("{rel}: a new file, {} lines", new.lines().count())),
-                (Some(old), Some(new)) => {
-                    let was = C::clear_replies(&rel, &old, false).0;
-                    let now_ = C::clear_replies(&rel, &new, false).0;
-                    let a: Vec<&str> = was.split('\n').collect();
-                    let b: Vec<&str> = now_.split('\n').collect();
-                    let d = diff::unified(&a, &b, 1);
-                    if !d.iter().any(|l| (l.starts_with('+') || l.starts_with('-')) && !l[1..].trim().is_empty()) {
-                        continue;
-                    }
-                    out.push(format!("{rel}:"));
-                    for (k, l) in d.iter().enumerate() {
-                        if l.starts_with("@@") {
-                            if k > 0 {
-                                out.push("  …".into());
-                            }
-                        } else {
-                            out.push(format!("  {l}"));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        let text = out.join("\n");
-        if text.len() > DIFF_CHARS {
-            let mut cut = text[..floor(&text, DIFF_CHARS)].rsplit_once('\n').map(|x| x.0).unwrap_or("").to_string();
-            cut.push_str("\n  … cut here: the history has all of it");
-            return cut;
-        }
-        text
-    }
-
-    // ---------- what the agent is told ----------
-
-    /// The paragraph (or list item) a caret on status line `i` sits under, in
-    /// the file as it is on disk: 0-based (start, end), skipping the app's
-    /// own status lines.
-    fn target_above(rel: &str, text: &str, i: usize) -> Option<(usize, usize)> {
-        let lines: Vec<&str> = text.split('\n').collect();
-        let skip: BTreeSet<usize> = C::statuses(rel, text).values().cloned().collect();
-        C::above(rel, &lines, i, &skip)
-    }
-
-    fn target_below(rel: &str, text: &str, i: usize) -> Option<(usize, usize)> {
-        let lines: Vec<&str> = text.split('\n').collect();
-        let skip: BTreeSet<usize> = C::statuses(rel, text).values().cloned().collect();
-        C::below(&lines, i, &skip)
-    }
-
-    /// The part of a file the agent needs, numbered, as it is on disk now.
-    fn view(&self, rel: &str, text: &str, mine: &[&Ask]) -> String {
-        let mut lines: Vec<&str> = text.split('\n').collect();
-        if lines.last() == Some(&"") {
-            lines.pop();
-        }
-        let n = lines.len();
-        let width = n.to_string().len();
-        let numbered = |lo: usize, hi: usize| -> Vec<String> {
-            (lo..=hi).map(|k| {
-                let l = lines[k - 1];
-                let l = if l.chars().count() > LINE_CUT {
-                    let cut: String = l.chars().take(LINE_CUT).collect();
-                    format!("{cut} … (cut here: {} more characters on this line, read the file for them)", l.chars().count() - LINE_CUT)
-                } else {
-                    l.to_string()
-                };
-                format!("{k:>width$}| {l}")
-            }).collect()
+        let _io = self.io.lock().unwrap();
+        let Some(mut text) = f.read(&a.rel) else {
+            f.history(&format!("## {} · {} · {} · agent ({}): the file is gone", now(), a.rel, a.id, status.word()));
+            f.commit(&format!("Ambition: agent answered {} in {}: {}", a.id, a.rel, util::cut(&a.p.text, 70)));
+            return;
         };
-        let path = util::tilde(&self.f.path(rel));
-        let whole = match self.context {
-            Context::Whole => n <= 2000 && text.len() <= 100_000,
-            _ => n <= WHOLE_LINES && text.len() <= WHOLE_CHARS,
-        };
-        if whole {
-            let mut out = vec![format!("{path}, all {n} line{}:", if n == 1 { "" } else { "s" })];
-            out.extend(numbered(1, n.max(1).min(n)));
-            return out.join("\n");
-        }
-        let st = C::statuses(rel, text);
-        let mut out = Vec::new();
-        for around in [AROUND, 5, 1] {
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            for a in mine {
-                let Some(&i) = st.get(&a.id) else { continue };
-                let (lo, hi) = match self.context {
-                    Context::Above => {
-                        let t = Self::target_above(rel, text, i).map(|t| t.0 + 1).unwrap_or(i + 1);
-                        (t.saturating_sub(around).max((i + 1).saturating_sub(60)), i + 1 + around)
-                    }
-                    _ => {
-                        let up = Self::target_above(rel, text, i).map(|t| t.0 + 1).unwrap_or(i + 1);
-                        let down = Self::target_below(rel, text, i).map(|t| t.1).unwrap_or(i + 1);
-                        (up.min((i + 1).saturating_sub(around)).max((i + 1).saturating_sub(60)),
-                         down.max(i + 1 + around).min(i + 1 + 60))
-                    }
-                };
-                spans.push((lo, hi));
-            }
-            let mut merged: Vec<(usize, usize)> = Vec::new();
-            let mut s: Vec<(usize, usize)> = spans.into_iter().map(|(lo, hi)| (lo.max(1), hi.min(n))).filter(|(lo, hi)| lo <= hi).collect();
-            s.sort();
-            for (lo, hi) in s {
-                match merged.last_mut() {
-                    Some(m) if lo <= m.1 + 1 => m.1 = m.1.max(hi),
-                    _ => merged.push((lo, hi)),
-                }
-            }
-            out = vec![format!("{path}, lines {} of {n}:", merged.iter().map(|(a, b)| format!("{a}-{b}")).collect::<Vec<_>>().join(", "))];
-            for (k, (lo, hi)) in merged.iter().enumerate() {
-                if k > 0 {
-                    out.push("…".into());
-                }
-                out.extend(numbered(*lo, *hi));
-            }
-            if out.join("\n").len() <= 2 * WHOLE_CHARS {
-                break;
-            }
-        }
-        out.join("\n")
-    }
-
-    /// What the agent is told for one save. It carries the writer's
-    /// attention: each prompt, where its caret is, the file around it, and
-    /// what they changed since the last turn. They can read it in the
-    /// engine's thread as it was sent.
-    pub fn message(&self, asks: &[Ask], typed: &(String, String)) -> String {
-        let files: BTreeSet<&str> = asks.iter().map(|a| a.rel.as_str()).collect();
-        let n = asks.len();
-        let mut parts = vec![format!(
-            "[Ambition] A save in {} with {n} caret prompt{}. Each is now a status line in its file. Do them in order, \
-             following the rules in this thread's first message: your answer goes in the file.{}",
-            files.iter().cloned().collect::<Vec<_>>().join(", "), if n > 1 { "s" } else { "" },
-            if self.context == Context::Pointer { "" } else { " The file text below is what is on disk right now, status lines included." }
-        )];
-        for a in asks {
-            let text = self.read(&a.rel).unwrap_or_default();
-            let lines: Vec<&str> = text.split('\n').collect();
-            let st = C::statuses(&a.rel, &text);
-            let i = st.get(&a.id).cloned();
-            let line = i.map(|i| (i + 1).to_string()).unwrap_or_else(|| "?".into());
-            let first = |(s, _e): (usize, usize)| util::cut(lines.get(s).copied().unwrap_or("").trim(), 50);
-            let on = match (self.context, i) {
-                (_, None) => "Its status line is gone from the file.".to_string(),
-                (Context::Above, Some(i)) => match Self::target_above(&a.rel, &text, i) {
-                    None => "The caret is at the top of the file, with nothing above it, so the prompt is about the whole file.".into(),
-                    Some((s, e)) => {
-                        let blk = {
-                            let skip: BTreeSet<usize> = st.values().cloned().collect();
-                            let mut j = s;
-                            while j > 0 && !lines[j - 1].trim().is_empty() && !skip.contains(&(j - 1)) {
-                                j -= 1;
-                            }
-                            (j, e)
-                        };
-                        if blk.0 != s {
-                            format!("The caret sits right under the list item on {}, the last item of the block on {}. Unless \
-                                their words point somewhere else (\"this list\", \"these\"), that item is what they mean.", C::span(s, e), C::span(blk.0, blk.1))
-                        } else {
-                            format!("The caret sits right under the paragraph on {}. Unless their words point somewhere else, \
-                                that paragraph is what they mean.", C::span(s, e))
-                        }
-                    }
-                },
-                (Context::Pointer, Some(i)) => format!("The caret is on line {} of {}.", i + 1, util::tilde(&self.f.path(&a.rel))),
-                (_, Some(i)) => {
-                    let up = Self::target_above(&a.rel, &text, i);
-                    let down = Self::target_below(&a.rel, &text, i);
-                    let say = |t: Option<(usize, usize)>, none: &str| match t {
-                        Some(t) => format!("{} (“{}”)", C::span(t.0, t.1), first(t)),
-                        None => none.to_string(),
-                    };
-                    if up.is_none() {
-                        format!("The caret is on line {}, at the top of the file, so the prompt is about the whole file. Below it: {}.",
-                            i + 1, say(down, "nothing"))
-                    } else {
-                        format!("The caret is on line {}. Just above it: {}. Just below it: {}.", i + 1,
-                            say(up, "nothing"), say(down, "nothing, the file ends"))
-                    }
-                }
-            };
-            let words: Vec<String> = a.p.text.split('\n').map(|l| format!("  {l}")).collect();
-            parts.push(format!("\n{} · {}, line {line} (`^ ◌ {} …`):\n{}\n  {on}", a.id, a.rel, a.id, words.join("\n")));
-        }
-        if self.context != Context::Pointer {
-            for rel in &files {
-                let mine: Vec<&Ask> = asks.iter().filter(|a| a.rel == *rel).collect();
-                let v = self.view(rel, &self.read(rel).unwrap_or_default(), &mine);
-                if !v.is_empty() {
-                    parts.push(format!("\n{v}"));
-                }
-            }
-        }
-        let plural = if n > 1 { "s" } else { "" };
-        if !typed.1.is_empty() {
-            parts.push(format!("\nWhat they changed in this folder since your last turn, besides the prompt{plural} (+ is new, - is gone):\n{}", typed.1));
+        let was: BTreeSet<String> = C::replies(&a.rel, &start).into_iter().collect();
+        let new_replies = C::replies(&a.rel, &text).into_iter().any(|l| !was.contains(&l));
+        let changed = text != start || others_changed(f, &a.rel);
+        let note = if !err.is_empty() {
+            Some(format!("{} did not reach the agent: {err}", a.id))
         } else {
-            parts.push(format!("\nBesides the prompt{plural}, nothing in this folder changed since your last turn."));
+            match &status {
+                Status::Completed => None,
+                Status::NeedsInput => Some(format!("{} is waiting for your answer in {}: {link}", a.id, self.engine.name())),
+                Status::Running => Some(format!("{} is still working after {} minutes: {link}. ^/stop stops it.", a.id, self.run_limit.as_secs() / 60)),
+                Status::Interrupted => Some(format!("{} was stopped before it finished. {link}", a.id)),
+                s => Some(format!("{}: the agent's turn ended as {}. {link}", a.id, s.word())),
+            }
+        };
+        if let Some(n) = note {
+            text = C::replace_status(&a.rel, &text, &a.id, &C::reply_lines(&a.p.lead, &n, 12));
+        } else if !said.is_empty() && !new_replies {
+            // The answer is in the thread but not in the file. The rules have the
+            // agent end its turn by repeating its ^> lines; when those never
+            // reached the file, they go where the prompt stood. With no ^> lines,
+            // the last message counts only when the turn changed no file at all.
+            let unmark = |l: &str| {
+                let t = l.trim_start();
+                t.strip_prefix("^>").map(|r| r.strip_prefix(' ').unwrap_or(r).to_string())
+            };
+            let marked: Vec<String> = said.split('\n').filter_map(unmark).collect();
+            let body = if !marked.is_empty() {
+                marked.join("\n")
+            } else if !changed {
+                said.split('\n').map(|l| unmark(l).unwrap_or_else(|| l.to_string())).collect::<Vec<_>>().join("\n")
+            } else {
+                String::new()
+            };
+            if !body.trim().is_empty() {
+                text = C::replace_status(&a.rel, &text, &a.id, &C::reply_lines(&a.p.lead, &body, 12));
+            }
         }
-        let told = self.told.lock().unwrap();
-        if !told.is_empty() {
-            parts.push(format!("\nCommands run since your last turn (for your memory, no action needed):\n{}",
-                told.iter().map(|t| format!("- {t}")).collect::<Vec<_>>().join("\n")));
+        f.write(&a.rel, &C::remove_marks(&a.rel, &text, &a.id));
+        let reps = C::replies(&a.rel, &f.read(&a.rel).unwrap_or_default());
+        f.history(&format!("## {} · {} · {} · agent ({}){}{}", now(), a.rel, a.id, status.word(),
+            if link.is_empty() { String::new() } else { format!("\nThread: {link}") },
+            if reps.is_empty() { String::new() } else { format!("\nReplies in the file now:\n{}", reps.join("\n")) }));
+        f.commit(&format!("Ambition: agent answered {} in {}: {}", a.id, a.rel, util::cut(&a.p.text, 70)));
+        drop(_io);
+        let head = f.head();
+        self.update_entry(&a.doc, |v| {
+            v["last"] = json!(head);
+            v["turns"] = json!(v["turns"].as_u64().unwrap_or(0) + 1);
+            v["updated"] = json!(now());
+        });
+        log(&format!("answered {} in {} ({})", a.id, util::tilde(&a.doc), status.word()));
+    }
+
+    fn message_turn(&self, place: &Place, m: Msg) {
+        let f = &place.f;
+        {
+            let _io = self.io.lock().unwrap();
+            f.commit(&format!("Ambition: saved before a message to {}", m.rel));
         }
-        parts.join("\n")
+        let start = m.doc == coordinator_doc();
+        let out = match self.ask_agent(place, &m.doc, &m.rel, &m.text, start, None) {
+            Ok((tid, _, run, Status::Completed)) => Ok(self.engine.reply(&tid, &run).unwrap_or_default().trim().to_string()),
+            Ok((_, link, _, s)) => Err(format!("the turn ended as {}: {link}", s.word())),
+            Err(e) => Err(e),
+        };
+        {
+            let _io = self.io.lock().unwrap();
+            let what = match &out {
+                Ok(a) => format!("Answer: {}", util::cut(a, 400)),
+                Err(e) => format!("Not answered: {e}"),
+            };
+            f.history(&format!("## {} · {} · message\n{}\n{what}", now(), m.rel, util::cut(&m.text, 400)));
+            f.commit(&format!("Ambition: agent answered a message in {}", m.rel));
+        }
+        if let Some(tx) = m.reply {
+            let _ = tx.send(out);
+        }
     }
 
     // ---------- the thread ----------
 
-    fn agents_text(&self) -> String {
-        ["AGENTS.md", "CLAUDE.md"].iter().filter_map(|n| self.read(n)).collect::<Vec<_>>().join("\n")
+    /// The AGENTS.md files a document's thread reads: Ambition's own, then
+    /// each on the way down from its folder to it.
+    fn agents(&self, doc: &Path, folder: &Path) -> Vec<PathBuf> {
+        let mut out = vec![util::state_real().join("AGENTS.md")];
+        let mut dirs = Vec::new();
+        let mut d = doc.parent();
+        while let Some(x) = d {
+            dirs.push(x.to_path_buf());
+            if x == folder || !x.starts_with(folder) {
+                break;
+            }
+            d = x.parent();
+        }
+        out.extend(dirs.into_iter().rev().map(|d| d.join("AGENTS.md")));
+        let mut seen = BTreeSet::new();
+        out.into_iter().filter(|p| p.is_file() && seen.insert(p.clone())).collect()
     }
 
-    fn project_id(&self) -> Result<String, String> {
-        let _one = self.project.lock().unwrap();
-        if let Some(p) = self.info()["project"].as_str() {
-            return Ok(p.to_string());
+    fn agents_sha(&self, doc: &Path, folder: &Path) -> String {
+        let text: String = self.agents(doc, folder).iter()
+            .map(|p| format!("{}\n{}\n", p.display(), std::fs::read_to_string(p).unwrap_or_default())).collect();
+        util::sha(&text)
+    }
+
+    fn project_id(&self, folder: &Path) -> Result<String, String> {
+        let mut m = self.projects.lock().unwrap();
+        if let Some(p) = m.get(folder) {
+            return Ok(p.clone());
         }
-        let p = self.engine.project(&self.f.root)?;
-        self.update_info(|v| v["project"] = json!(p));
+        let p = self.engine.project(folder)?;
+        m.insert(folder.to_path_buf(), p.clone());
         Ok(p)
     }
 
-    /// Why the next prompt needs a new thread, or None to use the one we have.
-    fn why_new(&self) -> Option<&'static str> {
-        let d = self.info();
-        let Some(tid) = d["threadId"].as_str() else { return Some("first") };
+    /// Why the document's next turn needs a new thread, or None to use the
+    /// one it has.
+    fn why_new(&self, doc: &Path, folder: &Path) -> Option<&'static str> {
+        let d = self.entry(doc);
+        let Some(tid) = d["thread"].as_str() else { return Some("first") };
         if d["new"].as_bool() == Some(true) {
             return Some("asked");
         }
-        if d["rules"].as_str() != Some(util::sha(&self.rules()).as_str()) {
+        if d["rules"].as_str() != Some(util::sha(RULES).as_str()) {
             return Some("rules");
         }
-        if d["agents"].as_str() != Some(util::sha(&self.agents_text()).as_str()) {
+        if d["agents"].as_str() != Some(self.agents_sha(doc, folder).as_str()) {
             return Some("agents");
         }
         match self.engine.thread(tid) {
             Ok(None) => Some("gone"),
-            _ => None, // busy or away: keep the thread we have
+            _ => None, // busy or away: keep the thread it has
         }
     }
 
-    fn tail_history(&self, skip: &[String]) -> String {
-        let text = self.read(HISTORY).unwrap_or_default();
+    fn tail_history(f: &Folder, rel: &str) -> String {
+        let text = std::fs::read_to_string(&f.log).unwrap_or_default();
         let mut entries: Vec<&str> = Vec::new();
         let mut rest = text.as_str();
         while let Some(i) = rest.find("\n## ") {
@@ -973,130 +800,241 @@ impl App {
             rest = &rest[i + 1..];
         }
         entries.push(rest);
-        let keep: Vec<&str> = entries.into_iter().filter(|e| e.starts_with("## "))
-            .filter(|e| !skip.iter().any(|id| e.lines().next().unwrap_or("").contains(&format!(" · {id} · asked")))).collect();
+        let tag = format!(" · {rel} · ");
+        let keep: Vec<&str> = entries.into_iter()
+            .filter(|e| e.starts_with("## ") && e.lines().next().unwrap_or("").contains(&tag) && !e.contains(" · asked\n")).collect();
         let out = keep[keep.len().saturating_sub(6)..].join("\n").trim().to_string();
         if out.len() <= 2500 {
-            out
-        } else {
-            format!("…{}", &out[ceil(&out, out.len() - 2500)..])
+            return out;
         }
+        let mut i = out.len() - 2500;
+        while !out.is_char_boundary(i) {
+            i += 1;
+        }
+        format!("…{}", &out[i..])
     }
 
     /// The first words of a new thread: the rules, and what came before.
-    pub fn handoff(&self, why: &str, ids: &[String]) -> String {
-        let d = self.info();
-        let old = d["threadId"].as_str().unwrap_or("");
+    pub fn handoff(&self, f: &Folder, doc: &Path, rel: &str, why: &str, what: &str) -> String {
+        let d = self.entry(doc);
+        let old = d["thread"].as_str().unwrap_or("");
         let reason = match why {
-            "first" => "This is the first thread for this folder.".to_string(),
-            "asked" => "Someone wrote `^/new`, which starts a new thread.".into(),
+            "first" => "This is the first thread for this document.".to_string(),
+            "asked" => "Someone pressed `^/new`, which starts a new thread.".into(),
             "rules" => "Ambition's rules changed after the last thread began, and a thread reads them only when it starts.".into(),
-            "agents" => "The folder's AGENTS.md changed after the last thread began, and a thread reads it only when it starts.".into(),
+            "agents" => "An AGENTS.md for this document changed after the last thread began, and a thread reads them only when it starts.".into(),
             _ => format!("{} no longer has the last thread.", self.engine.name()),
         };
-        let mut parts = vec![format!("[Ambition] A new thread starts here, for {}. {reason}", util::tilde(&self.f.root)), self.rules()];
+        let mut parts = vec![
+            format!("[Ambition] A new thread starts here, for {}, in the folder {}. {reason}", util::tilde(doc), util::tilde(&f.root)),
+            self.rules(doc, &f.root),
+        ];
+        if doc == coordinator_doc() {
+            parts.push("You are the coordinator: the end of “The coordinator” above is for you.".into());
+        }
+        let agents = self.agents(doc, &f.root);
+        if !agents.is_empty() {
+            let list: Vec<String> = agents.iter().map(|p| format!("- {}", util::tilde(p))).collect();
+            parts.push(format!("These AGENTS.md files apply to this document, the nearest last. Read the ones you have not \
+                loaded before you answer:\n{}", list.join("\n")));
+        }
+        if self.cli != "ambition" {
+            parts.push(format!("Here, run Ambition as `{}`: use that wherever these rules say `ambition`.", self.cli));
+        }
         if !old.is_empty() && why != "gone" {
             parts.push(format!("The thread before this one: {} (id {old}). Read it when you need more than this message gives.",
                 d["link"].as_str().filter(|l| !l.is_empty()).unwrap_or(old)));
         }
-        if why == "agents" {
-            let was = d["agents_text"].as_str().unwrap_or("");
-            let a: Vec<&str> = was.split('\n').collect();
-            let now_ = self.agents_text();
-            let b: Vec<&str> = now_.split('\n').collect();
-            let mut dd = diff::unified(&a, &b, 1).join("\n");
-            if dd.len() > 3000 {
-                dd = format!("{}\n… cut here", &dd[..floor(&dd, 3000)]);
-            }
-            if !dd.is_empty() {
-                parts.push(format!("What changed in AGENTS.md (you have loaded the new one):\n{dd}"));
-            }
+        let notes = util::state_real().join("notes.md");
+        if notes.exists() {
+            parts.push(format!("The notes threads keep for later ones are in {}.", util::tilde(&notes)));
         }
-        if self.f.path(NOTES).exists() {
-            parts.push(format!("The notes earlier threads kept for you are in {NOTES}."));
-        }
-        let h = self.tail_history(ids);
+        let h = Self::tail_history(f, rel);
         if !h.is_empty() {
-            parts.push(format!("The end of {HISTORY}, the record of every prompt and reply:\n{h}"));
+            parts.push(format!("The end of this document's history, from {}:\n{h}", util::tilde(&f.log)));
         }
-        parts.push("The save for you to answer follows.".into());
+        parts.push(format!("The {what} for you to answer follows."));
         parts.join("\n\n")
     }
 
-    /// Send one save's message to the folder's thread and wait for the turn.
-    fn ask_agent(&self, text: &str, asks: &[Ask]) -> Result<(String, String, String, Status), String> {
-        let ids: Vec<String> = asks.iter().map(|a| a.id.clone()).collect();
-        let why = self.why_new();
-        let d = self.info();
-        let (tid, link, run) = if let Some(why) = why {
-            let old = d["threadId"].as_str().unwrap_or("").to_string();
-            let project = self.project_id()?;
-            let sel = match (!old.is_empty() && why != "gone").then(|| self.engine.model_of(&old).ok().flatten()).flatten() {
-                Some(s) => Some(s),
-                None => self.engine.project_model(&project).ok().flatten().or_else(|| self.first_model(&project)),
-            };
-            let first = format!("{}\n\n{text}", self.handoff(why, &ids));
-            let title = format!("Ambition · {} · {}", self.f.root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-                util::minute());
-            let (tid, run) = self.engine.launch(&project, &title, &first, sel.as_ref())?;
-            let link = self.engine.thread(&tid).ok().flatten().map(|t| t.link).unwrap_or_default();
-            if !old.is_empty() && why != "gone" {
-                let _ = self.engine.settle(&old);
+    /// Send a message to a document's thread and wait for the turn. A new
+    /// thread starts when the document needs one and `start` allows it.
+    /// (thread id, link, run id, how it ended)
+    fn ask_agent(&self, place: &Place, doc: &Path, rel: &str, text: &str, start: bool, turn: Option<&str>)
+        -> Result<(String, String, String, Status), String> {
+        let root = &place.f.root;
+        let d = self.entry(doc);
+        let old = d["thread"].as_str().unwrap_or("").to_string();
+        let why = self.why_new(doc, root);
+        let (tid, link, run) = match why {
+            Some(w) if start => {
+                let project = self.project_id(root)?;
+                let sel = (!old.is_empty() && w != "gone").then(|| self.engine.model_of(&old).ok().flatten()).flatten()
+                    .or_else(|| self.last_model())
+                    .or_else(|| self.engine.project_model(&project).ok().flatten())
+                    .or_else(|| self.first_model(&project));
+                let first = format!("{}\n\n{text}", self.handoff(&place.f, doc, rel, w, if turn.is_some() { "press" } else { "message" }));
+                let title = if doc == coordinator_doc() { "Ambition · coordinator".to_string() } else { format!("Ambition · {rel}") };
+                let (tid, run) = self.engine.launch(&project, &title, &first, sel.as_ref())?;
+                let link = self.engine.thread(&tid).ok().flatten().map(|t| t.link).unwrap_or_default();
+                if !old.is_empty() && w != "gone" {
+                    let _ = self.engine.settle(&old);
+                }
+                let label = self.label(sel.as_ref());
+                let agents = self.agents_sha(doc, root);
+                self.update_entry(doc, |v| {
+                    v["folder"] = json!(key(root));
+                    v["thread"] = json!(tid);
+                    v["link"] = json!(link);
+                    v["model"] = json!(label);
+                    v["started"] = json!(now());
+                    v["rules"] = json!(util::sha(RULES));
+                    v["agents"] = json!(agents);
+                    v["new"] = json!(false);
+                    v["previous"] = if old.is_empty() { Value::Null } else { json!(old) };
+                });
+                place.f.history(&format!("## {} · {rel} · thread\nA new thread ({w}): {}", now(), if link.is_empty() { &tid } else { &link }));
+                log(&format!("new thread {tid} for {} ({w})", util::tilde(doc)));
+                (tid, link, run)
             }
-            let rules = util::sha(&self.rules());
-            let agents_text = self.agents_text();
-            let label = match &sel {
-                Some(s) => self.label(Some(s)),
-                None => self.label(self.current().as_ref()),
-            };
-            self.update_info(|v| {
-                let mut prev: Vec<Value> = if old.is_empty() { vec![] } else { vec![json!(old)] };
-                prev.extend(v["previous"].as_array().cloned().unwrap_or_default());
-                prev.truncate(20);
-                v["threadId"] = json!(tid);
-                v["link"] = json!(link);
-                v["started"] = json!(now());
-                v["rules"] = json!(rules);
-                v["agents"] = json!(util::sha(&agents_text));
-                v["agents_text"] = json!(agents_text);
-                v["previous"] = json!(prev);
-                v["model"] = json!(label);
-                v["new"] = json!(false);
-            });
-            self.f.history(&format!("## {} · thread\nA new thread ({why}): {}", now(), if link.is_empty() { &tid } else { &link }));
-            log(&format!("new thread {tid} ({why})"));
-            (tid, link, run)
-        } else {
-            let tid = d["threadId"].as_str().unwrap_or("").to_string();
-            let run = self.engine.send(&tid, text)?;
-            (tid, d["link"].as_str().unwrap_or("").to_string(), run)
+            Some("first") | Some("gone") => return Err(format!("{} has no thread; only a press in it starts one.", util::tilde(doc))),
+            _ => {
+                let run = self.engine.send(&old, text)?;
+                (old, d["link"].as_str().unwrap_or("").to_string(), run)
+            }
         };
-        self.publish(json!({"run": {"ids": ids, "thread": link, "since": util::epoch(), "model": self.info()["model"]}, "thread": link}));
+        place.q.lock().unwrap().tid = Some(tid.clone());
+        if let Some(id) = turn {
+            self.set_turn(id, |t| t.thread = link.clone());
+            self.publish();
+        }
         let status = self.engine.wait(&tid, &run, self.run_limit)?;
         Ok((tid, link, run, status))
     }
 
+    // ---------- what agents ask for ----------
+
+    /// The busy folder an agent's command came from, by its working folder:
+    /// (that turn's document, its thread link).
+    fn asker(&self, cwd: Option<&Path>) -> Option<(PathBuf, String)> {
+        let places: Vec<Arc<Place>> = self.places.lock().unwrap().values().cloned().collect();
+        let busy: Vec<(PathBuf, PathBuf)> = places.iter().filter_map(|p| {
+            let q = p.q.lock().unwrap();
+            q.tid.as_ref().and(q.doc.clone()).map(|d| (p.f.root.clone(), d))
+        }).collect();
+        let hit: Vec<&(PathBuf, PathBuf)> = match cwd {
+            Some(c) => busy.iter().filter(|(r, _)| c.starts_with(r)).collect(),
+            None => Vec::new(),
+        };
+        let pick = if hit.len() == 1 { Some(hit[0]) } else if busy.len() == 1 { Some(&busy[0]) } else {
+            // Nested folders: the deepest one that holds it.
+            hit.iter().max_by_key(|(r, _)| r.components().count()).copied()
+        };
+        pick.map(|(_, d)| (d.clone(), self.entry(d)["link"].as_str().unwrap_or("").to_string()))
+    }
+
+    /// `ambition more`: more of the document whose turn is running.
+    pub fn more(&self, up: bool, n: usize, cwd: Option<&Path>) -> Result<String, String> {
+        let mut turns = self.turns.lock().unwrap();
+        let working: Vec<usize> = (0..turns.len()).filter(|&k| turns[k].working && turns[k].seen != (0, 0)).collect();
+        let hit: Vec<usize> = working.iter().copied().filter(|&k| cwd.is_some_and(|c| c.starts_with(&turns[k].folder))).collect();
+        let k = match (hit.len(), working.len()) {
+            (1, _) => hit[0],
+            (_, 1) => working[0],
+            (_, 0) => return Err("no press is with an agent now, so there is no document to show more of.".into()),
+            _ => return Err("several presses are with agents now: run it from your document's folder.".into()),
+        };
+        let t = &mut turns[k];
+        let text = std::fs::read_to_string(&t.doc).map_err(|e| format!("cannot read {}: {e}", util::tilde(&t.doc)))?;
+        let (out, seen) = hook::more(&util::tilde(&t.doc), &text, t.seen, up, n);
+        t.seen = seen;
+        Ok(out)
+    }
+
+    /// `ambition ask`: a message for the coordinator, answered when its turn
+    /// ends; or, from the coordinator, one passed on to a document's thread.
+    pub fn ask(self: &Arc<Self>, to: &str, message: &str, cwd: Option<&Path>) -> Result<String, String> {
+        let message = message.trim();
+        if message.is_empty() || to.is_empty() {
+            return Err("ask whom, and what: ambition ask coordinator \"<message>\"".into());
+        }
+        let from = self.asker(cwd);
+        let who = match &from {
+            Some((d, _)) if *d == coordinator_doc() => "the coordinator".to_string(),
+            Some((d, l)) => format!("the thread for {}{}", util::tilde(d), if l.is_empty() { String::new() } else { format!(" ({l})") }),
+            None => "an agent Ambition could not place (it ran `ambition ask` outside any busy folder)".into(),
+        };
+        let quoted: Vec<String> = message.split('\n').map(|l| format!("  {l}")).collect();
+        let quoted = quoted.join("\n");
+        if to.eq_ignore_ascii_case("coordinator") {
+            let doc = coordinator_doc();
+            if from.as_ref().is_some_and(|(d, _)| *d == doc) {
+                return Err("you are the coordinator: answer in your own turn.".into());
+            }
+            if !doc.exists() {
+                let _ = std::fs::write(&doc, COORDINATOR_DOC);
+            }
+            let place = self.place(&util::state_real())?;
+            let text = format!("[Ambition] A message for the coordinator, from {who}:\n\n{quoted}\n\n\
+                Your last message in this turn is your answer: Ambition prints it for the thread that asked.");
+            let (tx, rx) = channel();
+            self.enqueue(&place, Job::Message(Msg { doc, rel: COORDINATOR.into(), text, reply: Some(tx) }));
+            return match rx.recv_timeout(self.run_limit + Duration::from_secs(120)) {
+                Ok(Ok(a)) if a.is_empty() => Ok("(the coordinator answered with nothing)".into()),
+                Ok(r) => r,
+                Err(_) => Err("the coordinator did not answer in time.".into()),
+            };
+        }
+        let doc = std::fs::canonicalize(util::expand(to)).map_err(|_| format!("{to}: no such file. Name a document, or `coordinator`."))?;
+        let d = self.entry(&doc);
+        let (Some(_), Some(root)) = (d["thread"].as_str(), d["folder"].as_str()) else {
+            return Err(format!("{} has no thread yet, and only a press in it starts one.", util::tilde(&doc)));
+        };
+        if from.as_ref().is_some_and(|(f, _)| *f == doc) {
+            return Err("that is your own document.".into());
+        }
+        let place = self.place(Path::new(root))?;
+        let rel = place.f.rel(&doc).unwrap_or_else(|| key(&doc));
+        let text = format!("[Ambition] A message for this document's thread, from {who}:\n\n{quoted}\n\n\
+            Answer in this thread. Change the document only if the message asks you to, and write no `^>` lines this turn.");
+        self.enqueue(&place, Job::Message(Msg { doc: doc.clone(), rel, text, reply: None }));
+        Ok(format!("passed on to the thread for {}: it reads it when its folder is free, and answers in its own thread{}.",
+            util::tilde(&doc), d["link"].as_str().filter(|l| !l.is_empty()).map(|l| format!(", {l}")).unwrap_or_default()))
+    }
+
     // ---------- models ----------
 
-    /// For a project with no model yet: the first one the engine lists, made
-    /// the project's default so its later threads get it too.
+    fn models_file() -> PathBuf {
+        own("models.json")
+    }
+
+    /// For a project with no model yet: the first one the engine lists.
     fn first_model(&self, project: &str) -> Option<Selection> {
         let m = self.refresh_models().ok()?.into_iter().next()?;
         let sel = Selection { instance: m.instance, model: m.id, effort: None };
         let _ = self.engine.use_model(None, project, &sel);
-        log(&format!("{} had no model for this folder: using {}, its first. ^/model changes it.", self.engine.name(), m.label));
+        log(&format!("{} had no model to start with: using {}, its first. ^/model changes it.", self.engine.name(), m.label));
         Some(sel)
     }
 
     fn refresh_models(&self) -> Result<Vec<Model>, String> {
         let ms = self.engine.models(None)?;
         let rows: Vec<Value> = ms.iter().map(model_json).collect();
-        save(&self.f.dot.join("models.json"), &json!({"models": rows, "at": util::epoch()}));
+        let _g = self.store.lock().unwrap();
+        let mut d = load(&Self::models_file());
+        d["models"] = json!(rows);
+        d["at"] = json!(util::epoch());
+        save(&Self::models_file(), &d);
         Ok(ms)
     }
 
     fn cached_models(&self) -> Vec<Model> {
-        load(&self.f.dot.join("models.json"))["models"].as_array().into_iter().flatten().filter_map(model_from).collect()
+        load(&Self::models_file())["models"].as_array().into_iter().flatten().filter_map(model_from).collect()
+    }
+
+    /// The model chosen last, which new threads start on.
+    fn last_model(&self) -> Option<Selection> {
+        sel_from(&load(&Self::models_file())["last"])
     }
 
     /// "Claude Sonnet 5.5 · high" for a selection.
@@ -1110,20 +1048,19 @@ impl App {
         }
     }
 
-    /// The model the thread uses now, else the one a new thread gets.
-    fn current(&self) -> Option<Selection> {
-        if let Some(tid) = self.info()["threadId"].as_str() {
+    /// The model the document's thread uses, else the one a new thread gets.
+    fn current(&self, doc: &Path) -> Option<Selection> {
+        if let Some(tid) = self.entry(doc)["thread"].as_str() {
             if let Ok(Some(s)) = self.engine.model_of(tid) {
                 return Some(s);
             }
         }
-        let pid = self.project_id().ok()?;
-        self.engine.project_model(&pid).ok().flatten()
+        self.last_model()
     }
 
-    fn cmd_model(&self, args: &str) -> String {
+    fn cmd_model(&self, place: &Place, doc: &Path, args: &str) -> String {
         let engine = self.engine.name();
-        let cur = self.current();
+        let cur = self.current(doc);
         let words: Vec<&str> = args.split_whitespace().collect();
         if words.is_empty() {
             let ms = match self.refresh_models() {
@@ -1154,7 +1091,7 @@ impl App {
             if let Some(c) = &cur {
                 let m = self.engine.models(Some(&c.model)).ok().and_then(|ms| ms.into_iter().find(|m| m.id == c.model));
                 if let Some(m) = m {
-                    return self.switch(&m, Some(words[0]));
+                    return self.switch(place, doc, &m, Some(words[0]));
                 }
             }
         }
@@ -1185,7 +1122,7 @@ impl App {
             (exact.len() == 1).then(|| exact[0].clone())
         };
         match pick {
-            Some(m) => self.switch(&m, effort),
+            Some(m) => self.switch(place, doc, &m, effort),
             None => {
                 let names: Vec<String> = hits.iter().take(12).map(|m| m.label.clone()).collect();
                 format!("model: “{q}” fits {} models: {}. Name one more exactly. Nothing changed.", hits.len(), names.join(" · "))
@@ -1193,7 +1130,7 @@ impl App {
         }
     }
 
-    fn switch(&self, m: &Model, effort: Option<&str>) -> String {
+    fn switch(&self, place: &Place, doc: &Path, m: &Model, effort: Option<&str>) -> String {
         let mut sel = Selection { instance: m.instance.clone(), model: m.id.clone(), effort: None };
         if let Some(e) = effort {
             let e = e.to_lowercase();
@@ -1206,27 +1143,31 @@ impl App {
             }
             sel.effort = Some((m.effort_id.clone(), e));
         }
-        let tid = self.info()["threadId"].as_str().map(str::to_string);
-        let pid = match self.project_id() {
+        let tid = self.entry(doc)["thread"].as_str().map(str::to_string);
+        let pid = match self.project_id(&place.f.root) {
             Ok(p) => p,
             Err(e) => return format!("model: could not reach {} ({e}). Nothing changed.", self.engine.name()),
         };
         if let Err(e) = self.engine.use_model(tid.as_deref(), &pid, &sel) {
             return format!("model: {} would not switch ({e}). Nothing changed.", self.engine.name());
         }
-        let mut ms = self.cached_models();
-        if !ms.iter().any(|x| x.id == m.id) {
-            ms.push(m.clone());
-            let rows: Vec<Value> = ms.iter().map(model_json).collect();
-            save(&self.f.dot.join("models.json"), &json!({"models": rows, "at": util::epoch()}));
+        {
+            let _g = self.store.lock().unwrap();
+            let mut d = load(&Self::models_file());
+            let mut ms: Vec<Value> = d["models"].as_array().cloned().unwrap_or_default();
+            if !ms.iter().any(|x| x["model"] == json!(m.id)) {
+                ms.push(model_json(m));
+            }
+            d["models"] = json!(ms);
+            d["last"] = sel_json(&sel);
+            save(&Self::models_file(), &d);
         }
         let label = self.label(Some(&sel));
-        self.update_info(|v| v["model"] = json!(label));
-        self.publish(json!({"model": label}));
         if tid.is_some() {
-            format!("model: {label}. The thread uses it from its next turn, and new threads do too.")
+            self.update_entry(doc, |v| v["model"] = json!(label));
+            format!("model: {label}. This file's thread uses it from its next turn, and new threads start on it.")
         } else {
-            format!("model: {label}. New threads use it.")
+            format!("model: {label}. New threads start on it, this file's first among them.")
         }
     }
 
@@ -1234,37 +1175,38 @@ impl App {
 
     fn help_text(&self) -> String {
         let mut rows: Vec<String> = Cm::BUILTINS.iter().map(|(n, d)| format!("/{n}: {d}")).collect();
-        let mine = Cm::find(&self.f.root);
+        let mine = Cm::find();
         let own: Vec<(&String, &PathBuf)> = mine.iter().filter(|(n, _)| !Cm::is_builtin(n)).collect();
         for (n, p) in &own {
             let d = Cm::describe(p);
             rows.push(format!("/{n}: {}", if d.is_empty() { p.file_name().unwrap().to_string_lossy().to_string() } else { d }));
         }
         if own.is_empty() {
-            rows.push(format!("Your own: a script in {COMMANDS}/ (its README.md says how)."));
+            rows.push(format!("Your own: a script in {}/ (its README.md says how).", util::tilde(&Cm::dir())));
         }
         rows.join("\n")
     }
 
-    fn cmd_thread(&self) -> String {
-        let d = self.info();
-        let Some(tid) = d["threadId"].as_str() else { return "thread: none yet. The next ^ prompt starts one.".into() };
+    fn cmd_thread(&self, doc: &Path) -> String {
+        let d = self.entry(doc);
+        let Some(tid) = d["thread"].as_str() else { return "thread: none yet. A press on a ^ prompt in this file starts one.".into() };
         let th = match self.engine.thread(tid) {
-            Ok(None) => return format!("thread: {} no longer has it. The next ^ prompt starts a new one, with a handoff.", self.engine.name()),
+            Ok(None) => return format!("thread: {} no longer has it. This file's next prompt starts a new one, with a handoff.", self.engine.name()),
             Ok(t) => t,
             Err(_) => None,
         };
         let link = d["link"].as_str().filter(|l| !l.is_empty()).unwrap_or(tid);
-        let model = d["model"].as_str().map(str::to_string).unwrap_or_else(|| self.label(self.current().as_ref()));
+        let model = d["model"].as_str().map(str::to_string).unwrap_or_else(|| self.label(self.current(doc).as_ref()));
         let mut out = format!("thread: {link} · model: {model}");
         let mut more = Vec::new();
         if let Some(t) = th {
             more.push(format!("status: {}, {} turn{}", t.status, t.turns, if t.turns == 1 { "" } else { "s" }));
         }
-        match self.why_new() {
-            Some("asked") => more.push("^/new was written, so the next ^ prompt starts a new thread".into()),
-            Some("rules") => more.push("Ambition's rules changed, so the next ^ prompt starts a new thread".into()),
-            Some("agents") => more.push("AGENTS.md changed, so the next ^ prompt starts a new thread".into()),
+        let folder = PathBuf::from(d["folder"].as_str().unwrap_or(""));
+        match self.why_new(doc, &folder) {
+            Some("asked") => more.push("^/new was pressed, so this file's next prompt starts a new thread".into()),
+            Some("rules") => more.push("Ambition's rules changed, so this file's next prompt starts a new thread".into()),
+            Some("agents") => more.push("an AGENTS.md changed, so this file's next prompt starts a new thread".into()),
             _ => {}
         }
         if !more.is_empty() {
@@ -1274,31 +1216,36 @@ impl App {
         out
     }
 
-    fn cmd_new(&self) -> String {
-        let d = self.info();
-        let Some(tid) = d["threadId"].as_str().map(str::to_string) else {
-            return "new: there is no thread yet; the next ^ prompt starts the first one.".into();
+    fn cmd_new(&self, doc: &Path) -> String {
+        let d = self.entry(doc);
+        let Some(tid) = d["thread"].as_str().map(str::to_string) else {
+            return "new: this file has no thread yet; its first prompt starts one.".into();
         };
-        self.update_info(|v| v["new"] = json!(true));
-        format!("new: the next ^ prompt starts a new thread, with a handoff from {}.", d["link"].as_str().filter(|l| !l.is_empty()).unwrap_or(&tid))
+        self.update_entry(doc, |v| v["new"] = json!(true));
+        format!("new: this file's next prompt starts a new thread, with a handoff from {}.", d["link"].as_str().filter(|l| !l.is_empty()).unwrap_or(&tid))
     }
 
-    fn cmd_stop(&self) -> String {
-        let run = self.st.lock().unwrap().run.clone();
-        let tid = self.info()["threadId"].as_str().map(str::to_string);
-        match (run, tid) {
-            (Some(ids), Some(tid)) => match self.engine.interrupt(&tid) {
-                Ok(()) => format!("stop: asked {} to stop the turn for {}.", self.engine.name(), ids.join(", ")),
+    fn cmd_stop(&self, place: &Place, held: bool) -> String {
+        let (busy, tid) = {
+            let q = place.q.lock().unwrap();
+            (q.busy.clone(), q.tid.clone())
+        };
+        match (held, busy, tid) {
+            (false, Some(b), Some(t)) => match self.engine.interrupt(&t) {
+                Ok(()) => format!("stop: asked {} to stop the turn for {b}.", self.engine.name()),
                 Err(e) => format!("stop: {} would not stop it ({e}).", self.engine.name()),
             },
-            _ => "stop: nothing is running.".into(),
+            (false, Some(b), None) => format!("stop: {b} has not reached its thread yet. Press ^/stop again in a moment."),
+            _ => format!("stop: nothing is running in {}.", util::tilde(&place.f.root)),
         }
     }
 
-    /// Undo Ambition's last change that is not undone yet.
-    fn undo(&self) -> String {
-        for (h, subject) in self.f.undoable() {
-            let plan = match self.f.reverse(&h) {
+    /// Undo Ambition's last change in the folder that is not undone yet.
+    fn undo(&self, place: &Place) -> String {
+        let f = &place.f;
+        let _io = self.io.lock().unwrap();
+        for (h, subject) in f.undoable() {
+            let plan = match f.reverse(&h) {
                 Ok(p) => p,
                 Err(why) => return format!("could not undo {h} ({}): {why}. Nothing changed.", util::cut(subject.trim_start_matches("Ambition: "), 64)),
             };
@@ -1308,36 +1255,37 @@ impl App {
             for (rel, text) in &plan {
                 match text {
                     None => {
-                        let _ = std::fs::remove_file(self.f.path(rel));
-                        self.known.lock().unwrap().remove(rel);
+                        let _ = std::fs::remove_file(f.path(rel));
                     }
-                    Some(t) => self.write(rel, t),
+                    Some(t) => {
+                        f.write(rel, t);
+                    }
                 }
             }
             let what = subject.trim_start_matches("Ambition: ");
-            self.f.commit(&format!("Ambition: undo {h}: {what}"));
+            f.commit(&format!("Ambition: undo {h}: {what}"));
             return format!("undid {h}: {} ({})", util::cut(what, 110), plan.keys().cloned().collect::<Vec<_>>().join(", "));
         }
         "nothing left to undo.".into()
     }
 
-    fn run_command(&self, c: &C::Command, rel: &str, above: &str, during_run: bool) -> String {
+    fn run_command(&self, c: &C::Command, place: &Place, doc: &Path, rel: &str, above: &str, held: bool) -> String {
         match c.name.as_str() {
             "help" => self.help_text(),
-            "model" => self.cmd_model(&c.args),
-            "new" => self.cmd_new(),
-            "thread" => self.cmd_thread(),
-            "stop" => self.cmd_stop(),
-            "undo" if during_run => "undo: the agent is working. Write ^/undo again when its turn ends.".into(),
-            "undo" => self.undo(),
+            "model" => self.cmd_model(place, doc, &c.args),
+            "new" => self.cmd_new(doc),
+            "thread" => self.cmd_thread(doc),
+            "stop" => self.cmd_stop(place, held),
+            "undo" if !held => format!("undo: an agent is working in {}. Press ^/undo again when its turn ends.", util::tilde(&place.f.root)),
+            "undo" => self.undo(place),
             name => {
-                let mine = Cm::find(&self.f.root);
+                let mine = Cm::find();
                 let Some(p) = mine.get(name) else {
                     let all: Vec<&str> = Cm::BUILTINS.iter().map(|(n, _)| *n).chain(mine.keys().map(String::as_str)).collect();
                     let near = diff::closest(name, all);
                     return format!("/{name}: no such command.{} ^/help lists them.", near.map(|n| format!(" Did you mean ^/{n}?")).unwrap_or_default());
                 };
-                let (out, code) = Cm::run(&self.f.root, p, &c.args, rel, c.line + 1, above);
+                let (out, code) = Cm::run(&place.f.root, p, &c.args, rel, c.line + 1, above);
                 let out = if out.is_empty() { "(no output)".to_string() } else { out };
                 if code != 0 && code != -1 {
                     format!("{out}\n(exit {code})")
@@ -1347,99 +1295,18 @@ impl App {
             }
         }
     }
-
-    /// The paragraph (or last list item) just above line index `at`, as text.
-    fn unit_above(rel: &str, text: &str, at: usize) -> String {
-        let lines: Vec<&str> = text.split('\n').collect();
-        C::above(rel, &lines, at.min(lines.len()), &BTreeSet::new()).map(|(s, e)| lines[s..e].join("\n")).unwrap_or_default()
-    }
-
-    /// Run commands and return their replies by file: (line index for the
-    /// reply, the command's own line, reply lines). Each comes with the index
-    /// where it stood in the file once its caret lines were out.
-    fn do_commands(&self, order: &[(String, C::Command, usize)], base: &BTreeMap<String, String>, during_run: bool)
-        -> BTreeMap<String, Vec<(usize, usize, Vec<String>)>> {
-        let mut out: BTreeMap<String, Vec<(usize, usize, Vec<String>)>> = BTreeMap::new();
-        for (rel, c, pos) in order {
-            let text = self.read(rel).unwrap_or_default();
-            // An earlier command may have changed the file since the positions were taken.
-            let here = base.get(rel).map(|b| diff::remap(b, &text, *pos)).unwrap_or(*pos);
-            let reply = self.run_command(c, rel, &Self::unit_above(rel, &text, here), during_run);
-            out.entry(rel.clone()).or_default().push((*pos, c.line, C::reply_lines(&c.lead, &reply, 12)));
-            let line = format!("^/{} {}", c.name, c.args);
-            self.f.history(&format!("## {} · {rel} · ^/{} · command\n{}\n{}", now(), c.name, line.trim_end(),
-                C::reply_lines("", &reply, usize::MAX).join("\n")));
-            self.told.lock().unwrap().push(format!("{} in {rel} → {}", line.trim_end(), util::cut(&reply, 200)));
-        }
-        out
-    }
-
-    /// Commands written while the agent works: they run now, not after.
-    fn mid_run_commands(&self) {
-        let rels: Vec<String> = std::mem::take(&mut self.st.lock().unwrap().mid).into_iter().collect();
-        for rel in rels {
-            let _g = self.io.lock().unwrap();
-            let text = self.read(&rel).unwrap_or_default();
-            let cmds = C::commands(&rel, &text);
-            if cmds.is_empty() {
-                continue;
-            }
-            let ranges: Vec<(usize, usize)> = cmds.iter().map(|c| (c.line, c.line + 1)).collect();
-            let (stripped, pos) = C::remove(&text, &ranges);
-            self.write(&rel, &stripped);
-            let order: Vec<(String, C::Command, usize)> = cmds.into_iter().zip(pos).map(|(c, p)| (rel.clone(), c, p)).collect();
-            let base = BTreeMap::from([(rel.clone(), stripped.clone())]);
-            let replies = self.do_commands(&order, &base, true);
-            let mut text = self.read(&rel).unwrap_or_default();
-            let mut adds: Vec<(usize, usize, Vec<String>)> = replies.get(&rel).cloned().unwrap_or_default()
-                .into_iter().map(|(at, line, lines)| (diff::remap(&stripped, &text, at), line, lines)).collect();
-            adds.sort_by_key(|x| (x.0, x.1));
-            for (at, _, lines) in adds.into_iter().rev() {
-                text = C::insert(&text, at, &lines);
-            }
-            self.write(&rel, &text);
-            self.f.commit(&format!("Ambition: command during a run in {rel}"));
-            log(&format!("command during a run in {rel}"));
-        }
-    }
 }
 
-/// Wait until saves stop coming for a moment.
-fn settle(rx: &Receiver<()>) {
-    loop {
-        match rx.recv_timeout(QUIET) {
-            Ok(()) => continue,
-            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => return,
-        }
-    }
+/// Whether a file other than `rel` differs from the last commit.
+fn others_changed(f: &Folder, rel: &str) -> bool {
+    let out = f.git(&["status", "--porcelain", "-z", "--untracked-files=all"]);
+    out.stdout.split(|&b| b == 0).filter_map(|s| std::str::from_utf8(s).ok()).filter(|s| s.len() > 3).any(|s| &s[3..] != rel)
 }
 
-fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else { return out };
-    for e in rd.flatten() {
-        let p = e.path();
-        if e.file_name().to_string_lossy().starts_with('.') {
-            continue;
-        }
-        if p.is_dir() {
-            out.extend(walk(&p));
-        } else {
-            out.push(p);
-        }
-    }
-    out
-}
-
-pub fn load(p: &std::path::Path) -> Value {
-    std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({}))
-}
-
-pub fn save(p: &std::path::Path, v: &Value) {
-    let tmp = p.with_extension(format!("tmp{}", util::nonce()));
-    if std::fs::write(&tmp, format!("{}\n", serde_json::to_string_pretty(v).unwrap_or_default())).is_ok() {
-        let _ = std::fs::rename(&tmp, p);
-    }
+/// The paragraph (or last list item) just above line index `at`, as text.
+fn unit_above(rel: &str, text: &str, at: usize) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    C::above(rel, &lines, at.min(lines.len()), &BTreeSet::new()).map(|(s, e)| lines[s..e].join("\n")).unwrap_or_default()
 }
 
 fn model_json(m: &Model) -> Value {
@@ -1457,22 +1324,14 @@ fn model_from(v: &Value) -> Option<Model> {
     })
 }
 
-/// The largest char boundary at or below i.
-fn floor(s: &str, i: usize) -> usize {
-    let mut i = i.min(s.len());
-    while !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
+fn sel_json(s: &Selection) -> Value {
+    json!({"instance": s.instance, "model": s.model, "effort": s.effort.as_ref().map(|(k, v)| json!([k, v]))})
 }
 
-/// The smallest char boundary at or above i.
-fn ceil(s: &str, i: usize) -> usize {
-    let mut i = i.min(s.len());
-    while !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
+fn sel_from(v: &Value) -> Option<Selection> {
+    let model = v["model"].as_str()?.to_string();
+    let effort = v["effort"].as_array().and_then(|e| Some((e.first()?.as_str()?.to_string(), e.get(1)?.as_str()?.to_string())));
+    Some(Selection { instance: v["instance"].as_str().unwrap_or("").to_string(), model, effort })
 }
 
 #[cfg(test)]
@@ -1480,8 +1339,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_rules_carry_the_section_they_are_varied_by() {
-        assert!(RULES.contains(ATTENTION_AROUND), "RULES.md and ATTENTION_AROUND have drifted apart");
-        assert!(!RULES.contains("{attention}"));
+    fn the_rules_name_the_document_and_the_hook() {
+        assert!(RULES.contains("{document}") && RULES.contains("{folder}"));
+        assert!(RULES.contains("ambition more up") && RULES.contains("ambition ask coordinator"));
+        assert!(!RULES.to_lowercase().contains("when they save"), "a save sends nothing now");
     }
 }

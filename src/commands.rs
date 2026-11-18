@@ -1,11 +1,11 @@
 //! `^/` commands: answered at once, in code, never by a model.
 //!
 //! The built-ins live in `app.rs`. Your own are files in
-//! `.ambition/commands/`: `count`, `count.sh` and `count.py` all answer
-//! `^/count`.
+//! `~/.ambition/commands/`, for every folder: `count`, `count.sh` and
+//! `count.py` all answer `^/count`.
 //!
-//! - It runs in the folder, with the words after its name as arguments, for
-//!   at most ten seconds, with no sandbox.
+//! - It runs in the file's folder, with the words after its name as
+//!   arguments, for at most ten seconds, with no sandbox.
 //! - Its stdin is the paragraph just above the command line.
 //! - `AMBITION_FILE` (the file, relative to the folder), `AMBITION_LINE`
 //!   (1-based) and `AMBITION_DIR` say where it was written.
@@ -25,9 +25,9 @@ use std::time::{Duration, Instant};
 pub const BUILTINS: [(&str, &str); 6] = [
     ("help", "list the commands"),
     ("model", "show the models the engine offers, or switch: ^/model opus, ^/model sonnet high"),
-    ("new", "start a new thread on the next ^ prompt, with a handoff from this one"),
-    ("thread", "the link to this folder's thread, and what it is doing"),
-    ("stop", "stop the agent's turn that is running now"),
+    ("new", "start a new thread for this file on its next ^ prompt, with a handoff"),
+    ("thread", "the link to this file's thread, and what it is doing"),
+    ("stop", "stop the agent's turn running in this folder now"),
     ("undo", "take back Ambition's last change (an agent's turn or a command)"),
 ];
 
@@ -40,10 +40,15 @@ pub fn is_builtin(name: &str) -> bool {
     BUILTINS.iter().any(|(n, _)| *n == name)
 }
 
-/// {name: path} of the command files in `<folder>/.ambition/commands/`.
-pub fn find(folder: &Path) -> BTreeMap<String, PathBuf> {
+/// Where your own commands live.
+pub fn dir() -> PathBuf {
+    crate::util::state_dir().join("commands")
+}
+
+/// {name: path} of the command files in `~/.ambition/commands/`.
+pub fn find() -> BTreeMap<String, PathBuf> {
     let mut out = BTreeMap::new();
-    let Ok(dir) = std::fs::read_dir(folder.join(crate::folder::COMMANDS)) else { return out };
+    let Ok(dir) = std::fs::read_dir(dir()) else { return out };
     let mut paths: Vec<PathBuf> = dir.filter_map(|e| e.ok().map(|e| e.path())).collect();
     paths.sort();
     for p in paths {
@@ -254,27 +259,29 @@ fn executable(p: &Path) -> bool {
 pub const README: &str = "\
 # Your commands
 
-A command is a line that starts with `^/`: `^/count`, `^/stamp`. Ambition
-runs it the moment you save, with no model, and what it prints takes the
-line's place as `^>` reply lines.
+A command is a line that starts with `^/`: `^/count`, `^/stamp`. Press
+Ambition's key on it and it runs at once, with no model, and what it prints
+takes the line's place as `^>` reply lines. The commands here work in every
+folder.
 
 Each file here is one command, named for it: `count.sh`, `count.py` or
 `count` all answer `^/count`. A built-in (`^/help` lists them) wins over a
 file of the same name.
 
-- It runs in the folder, with the words after its name as arguments, for at
-  most ten seconds.
+- It runs in the folder of the file it was pressed in, with the words after
+  its name as arguments, for at most ten seconds.
 - Its stdin is the paragraph just above the command line, so `^/count`
   under a paragraph counts that paragraph.
-- `AMBITION_FILE`, `AMBITION_LINE` and `AMBITION_DIR` say where it was
-  written.
+- `AMBITION_FILE` (the file, from its folder), `AMBITION_LINE` and
+  `AMBITION_DIR` (the folder) say where it was pressed.
 - What it prints becomes the reply. It may also change files: `^/undo`
   takes that back.
 - Its first comment line is its description: `^/help` shows it.
 - An executable file runs as it is; otherwise `.py` runs with python3, `.sh`
   with sh, `.js` with node, `.rb` with ruby.
 
-You do not have to write one yourself. Under any paragraph, write:
+You do not have to write one yourself. Under any paragraph, write this and
+press the key on it:
 
     ^ write me a command called shout that prints the paragraph above in capitals
 ";
