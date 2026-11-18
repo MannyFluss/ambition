@@ -388,6 +388,12 @@ fn core(h: &mut H) {
     });
     h.ask("notes.md", "Wait for me.\n^ take your time\n", "^ take your time");
     h.until("notes.md", 10.0, |t| t.contains('◌'));
+    // The status line is written before the message reaches T3; on a busy
+    // machine that send can lag, so wait until the turn is running there.
+    let t0 = Instant::now();
+    while !h.t3.running() && t0.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(40));
+    }
     h.ask("notes.md", &format!("{}\n\nMeanwhile.\n^/help\n\n^/undo\n", h.note("notes.md").trim_end()), "^/help");
     let mid = h.until("notes.md", 10.0, |t| t.contains("^> /help:"));
     let still = h.t3.running();
