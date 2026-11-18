@@ -1,0 +1,10 @@
+// Ambition's key in Zed: control-option-return. Copy this entry into
+// ~/.config/zed/keymap.json (Zed: "zed: open keymap"), next to tasks.json.
+[
+  {
+    "context": "Editor",
+    "bindings": {
+      "ctrl-alt-enter": ["task::Spawn", { "task_name": "Ambition: press" }]
+    }
+  }
+]

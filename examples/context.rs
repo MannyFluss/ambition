@@ -9,6 +9,7 @@
 //!
 //!     cargo build --release
 //!     cargo run --release --example context -- <scratch folder> [reps] [workers] [model words]
+//!     cargo run --release --example context -- --recheck <that folder>
 //!
 //! It needs T3 Code running, and it spends real model turns. Ambition 0.1
 //! tried four other ways on 2026-11-16 (the paragraph above, above and below,
@@ -21,7 +22,6 @@ use ambition::inbox;
 use ambition::t3::T3;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -259,12 +259,51 @@ fn cases() -> Vec<Case> {
     ]
 }
 
+/// The case's file as the agent found it: the prompt out (it was a status
+/// line), the rest as written.
+fn before(case: &Case) -> String {
+    let p = C::prompts(case.file, &case.text).remove(0);
+    C::remove(&case.text, &[(p.start, p.end)]).0
+}
+
+/// Check the saved runs in `<dir>/results.json` again, with no new turns.
+fn recheck(dir: &Path) {
+    let cases = cases();
+    let mut rows: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(dir.join("results.json")).unwrap()).unwrap();
+    for r in rows.iter_mut() {
+        let case = cases.iter().find(|c| r["case"] == json!(c.name)).expect("a known case");
+        let (ok, note) = (case.check)(&before(case), r["after"].as_str().unwrap_or(""));
+        if r["ok"] != json!(ok) {
+            println!("{} now {} ({note})", case.name, if ok { "passes" } else { "fails" });
+        }
+        r["ok"] = json!(ok);
+        r["note"] = json!(note);
+    }
+    std::fs::write(dir.join("results.json"), serde_json::to_string_pretty(&rows).unwrap()).unwrap();
+    summary(&rows, dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default().as_str());
+}
+
+fn summary(rows: &[Value], name: &str) {
+    let pass = rows.iter().filter(|r| r["ok"] == true).count();
+    let mut secs: Vec<f64> = rows.iter().map(|r| r["secs"].as_f64().unwrap_or(0.0)).collect();
+    secs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med = secs.get(secs.len() / 2).cloned().unwrap_or(0.0);
+    let more = rows.iter().filter(|r| r["more"].as_u64().unwrap_or(0) > 0).count();
+    for r in rows.iter().filter(|r| r["ok"] != true) {
+        println!("FAIL {} ({})", r["case"].as_str().unwrap_or(""), r["note"].as_str().unwrap_or(""));
+    }
+    println!("\n{name}: passed {pass} of {}, median {med:.1} s a turn, `ambition more` in {more} runs", rows.len());
+}
+
 fn turns(state: &Path) -> Vec<Value> {
     ambition::app::load(&state.join("state.json"))["turns"].as_array().cloned().unwrap_or_default()
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--recheck") {
+        return recheck(Path::new(args.get(1).expect("the folder of a run")));
+    }
     let root = PathBuf::from(args.first().expect("a scratch folder"));
     let reps: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2);
     let workers: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
@@ -317,11 +356,10 @@ fn main() {
     }
     let jobs = Arc::new(Mutex::new(jobs));
     let results = Arc::new(Mutex::new(Vec::new()));
-    let used = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
     for folder in folders {
-        let (jobs, results, cases, app, engine, state, more, used) =
-            (jobs.clone(), results.clone(), cases.clone(), app.clone(), engine.clone(), state.clone(), more.clone(), used.clone());
+        let (jobs, results, cases, app, engine, state, more) =
+            (jobs.clone(), results.clone(), cases.clone(), app.clone(), engine.clone(), state.clone(), more.clone());
         handles.push(std::thread::spawn(move || loop {
             let Some((rep, ci)) = jobs.lock().unwrap().pop() else { break };
             let case = &cases[ci];
@@ -343,11 +381,8 @@ fn main() {
             }
             let secs = began.elapsed().as_secs_f64();
             let looked = calls(&more) - before_more;
-            if looked > 0 {
-                used.fetch_add(1, Ordering::Relaxed);
-            }
             let after = std::fs::read_to_string(&file).unwrap_or_default();
-            let (ok, note) = (case.check)(&case.text, &after);
+            let (ok, note) = (case.check)(&before(case), &after);
             let entry = ambition::app::load(&state.join("threads"))[file.to_string_lossy().as_ref()].clone();
             if let Some(tid) = entry["thread"].as_str() {
                 let _ = engine.settle(tid);
@@ -362,10 +397,5 @@ fn main() {
     }
     let results = results.lock().unwrap().clone();
     std::fs::write(root.join("results.json"), serde_json::to_string_pretty(&results).unwrap()).unwrap();
-    let pass = results.iter().filter(|r| r["ok"] == true).count();
-    let mut secs: Vec<f64> = results.iter().map(|r| r["secs"].as_f64().unwrap_or(0.0)).collect();
-    secs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let med = secs.get(secs.len() / 2).cloned().unwrap_or(0.0);
-    println!("\n{}: passed {pass} of {}, median {med:.1} s a turn, `ambition more` in {} runs",
-        model.label, results.len(), used.load(Ordering::Relaxed));
+    summary(&results, &model.label);
 }

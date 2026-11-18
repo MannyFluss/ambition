@@ -1,6 +1,7 @@
 //! Ambition for Zed: it starts `ambition lsp`, the language server built into
-//! the ambition binary, which does the rest. The server acts only on files in
-//! folders Ambition watches and leaves every other file alone.
+//! the ambition binary, which colors caret lines and says what a press on one
+//! sends. It never sends anything: the press is a Zed task bound to a key
+//! (`tasks.json` and `keymap.json` beside this extension).
 //!
 //! It finds `ambition` on your PATH. To use another copy, set
 //! `lsp.ambition.binary.path` in Zed's settings, as for any language server.

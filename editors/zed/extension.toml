@@ -1,9 +1,9 @@
 id = "ambition"
 name = "Ambition"
-version = "0.1.0"
+version = "0.2.0"
 schema_version = 1
 authors = ["MannyFluss"]
-description = "Colors, completion, hover and the run's state for Ambition's caret lines (^ prompts, ^/ commands, ^> replies)."
+description = "Colors, completion, hover and the turn's state for Ambition's caret lines (^ prompts, ^/ commands, ^> replies). The key that sends them is a task: see the README."
 repository = "https://github.com/MannyFluss/ambition"
 
 [language_servers.ambition]

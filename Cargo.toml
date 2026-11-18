@@ -9,7 +9,7 @@ repository = "https://github.com/MannyFluss/ambition"
 readme = "README.md"
 keywords = ["agent", "editor", "notes", "lsp", "t3"]
 categories = ["command-line-utilities", "text-editors"]
-exclude = ["editors/", "media/", ".github/"]
+exclude = ["editors/", "media/", "proof/", ".github/"]
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

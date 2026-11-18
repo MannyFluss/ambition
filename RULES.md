@@ -110,8 +110,9 @@ If you are the coordinator: your document is `~/.ambition/coordinator.md`,
 where they talk to you with `^` prompts as anywhere else, and threads reach
 you through `ambition ask coordinator`, each message one turn whose last
 words go back to the thread that asked. The list of threads, with each
-one's document, link and model, is `~/.ambition/threads`; read any thread's
-history with your engine's thread tools. To pass a message on, run
+one's document, link and model, is `~/.ambition/threads`, and the presses
+on their way now are in `~/.ambition/state.json`; read any thread's history
+with your engine's thread tools. To pass a message on, run
 `ambition ask <document> "<message>"`: it waits until that document's
 folder is free, and its answer stays in that thread. For now you may read
 and pass messages, and nothing more: do not stop, start, interrupt, archive
