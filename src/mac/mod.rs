@@ -212,14 +212,24 @@ extern "C" fn on_hotkey(_call: *mut c_void, _event: *mut c_void, _user: *mut c_v
         return 0;
     }
     if let Some(app) = APP.get().cloned() {
+        log(&format!("the key, in {}", f.name));
         std::thread::spawn(move || press(app, f));
     }
     0
 }
 
-/// One press of the key, off the main thread.
+/// One press of the key, off the main thread: the grant first, then the
+/// field is read.
 fn press(app: Arc<App>, f: Front) {
-    let r = pool(|| ax::snapshot(&f)).and_then(|(snap, surface)| app.field_press(snap, Arc::new(surface)));
+    let r = if !ax::trusted() {
+        ax::ask_trust();
+        Err("Ambition needs Accessibility to read text fields. In System Settings › Privacy & Security › Accessibility, \
+            turn on Ambition, then press again.".to_string())
+    } else {
+        app.grant_app(&f.name, &f.bundle)
+            .and_then(|_| pool(|| ax::snapshot(&f)))
+            .and_then(|(snap, surface)| app.field_press(snap, Arc::new(surface)))
+    };
     match r {
         Ok(t) => log(&format!("a press in {}: {t}", f.name)),
         Err(e) => ui::tell(&e),
@@ -259,6 +269,11 @@ pub fn run(app: Arc<App>, lock: std::fs::File) -> ! {
                     null_mut::<c_void>() => Id; ());
             }
             refresh(&front().map(|f| f.bundle).unwrap_or_default());
+            // Lay one dialog out now, unseen, so the first press's dialog
+            // comes up at once.
+            let warm = msg!(msg!(class("NSAlert"), "alloc"; Id), "init"; Id);
+            msg!(warm, "layout"; ());
+            msg!(warm, "release"; ());
             match HOT.lock().unwrap().chord {
                 Some(_) => log(&format!("The key {} presses in any text field.", config::hotkey_words())),
                 None => log("The global key is off or stepped aside."),
@@ -311,6 +326,7 @@ unsafe fn alert(title: &str, text: &str) -> Answer {
     let modes = msg!(class("NSArray"), "arrayWithObject:", mode.0 as Id => Id; Id);
     msg!(nsapp, "performSelector:withObject:afterDelay:inModes:", sel("abortModal") => Sel, null_mut::<c_void>() => Id,
         120.0f64 => f64, modes => Id; ());
+    log(&format!("asking: {title}"));
     let r = msg!(a, "runModal"; isize);
     msg!(class("NSObject"), "cancelPreviousPerformRequestsWithTarget:selector:object:", nsapp => Id, sel("abortModal") => Sel,
         null_mut::<c_void>() => Id; ());

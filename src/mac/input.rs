@@ -26,6 +26,8 @@ const WATCH: u8 = 2;
 
 static MODE: AtomicU8 = AtomicU8::new(OFF);
 static UNTIL: AtomicU64 = AtomicU64::new(0);
+/// What you did while a change was highlighted: nothing, a key, a click.
+static ACTED: AtomicU8 = AtomicU8::new(0);
 static TAP: Mutex<usize> = Mutex::new(0);
 static HELD: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 #[allow(clippy::type_complexity)]
@@ -62,6 +64,11 @@ extern "C" fn tapped(_proxy: *mut c_void, ty: u32, ev: CGEventRef, _user: *mut c
                 if let Some(f) = ON_KEY.lock().unwrap().take() {
                     f();
                 }
+                ACTED.store(1, Ordering::SeqCst);
+                ev
+            }
+            WATCH if matches!(ty, 1 | 3 | 25) => {
+                ACTED.store(2, Ordering::SeqCst);
                 ev
             }
             _ => ev,
@@ -142,16 +149,29 @@ fn let_go() -> usize {
     held.len()
 }
 
-/// For `wait`, or until a key: then `on_key` runs first.
-pub fn watch(wait: Duration, on_key: Box<dyn FnOnce() + Send>) {
+#[derive(Debug, PartialEq)]
+pub enum Acted {
+    Nothing,
+    Key,
+    Click,
+}
+
+/// For `wait`, or until you press a key (then `on_key` runs first) or click.
+pub fn watch(wait: Duration, on_key: Box<dyn FnOnce() + Send>) -> Acted {
+    ACTED.store(0, Ordering::SeqCst);
     *ON_KEY.lock().unwrap() = Some(on_key);
     switch(WATCH);
     let end = Instant::now() + wait;
-    while Instant::now() < end && ON_KEY.lock().unwrap().is_some() {
+    while Instant::now() < end && ACTED.load(Ordering::SeqCst) == 0 {
         std::thread::sleep(Duration::from_millis(15));
     }
     switch(OFF);
     *ON_KEY.lock().unwrap() = None;
+    match ACTED.load(Ordering::SeqCst) {
+        1 => Acted::Key,
+        2 => Acted::Click,
+        _ => Acted::Nothing,
+    }
 }
 
 /// Press a key, with these modifier flags, as Ambition.
@@ -175,13 +195,8 @@ pub fn paste(text: &str) {
         msg!(pb, "clearContents"; isize);
         let s = super::cfstr(text);
         let t = super::cfstr("public.utf8-plain-text");
+        // Plain text only: Discord pastes any other type as a block of its own.
         msg!(pb, "setString:forType:", s.0 as Id => Id, t.0 as Id => Id; bool);
-        // Clipboard managers leave these out of their history.
-        let empty = super::cfstr("");
-        for k in ["org.nspasteboard.TransientType", "org.nspasteboard.ConcealedType"] {
-            let k = super::cfstr(k);
-            msg!(pb, "setString:forType:", empty.0 as Id => Id, k.0 as Id => Id; bool);
-        }
     });
     key(9, kCGEventFlagMaskCommand); // ⌘V
 }

@@ -738,7 +738,7 @@ impl Ed {
         let text = std::fs::read_to_string(state.join("inbox")).unwrap();
         let (addr, token) = text.trim().split_once(' ').unwrap();
         let mut out = std::net::TcpStream::connect(addr).unwrap();
-        writeln!(out, "{}", serde_json::json!({"op": "editor", "token": token, "client": "TestEd"})).unwrap();
+        writeln!(out, "{}", serde_json::json!({"op": "editor", "token": token, "client": "TestEd", "shows": true})).unwrap();
         let mut r = BufReader::new(out.try_clone().unwrap());
         let mut line = String::new();
         r.read_line(&mut line).unwrap();
@@ -923,6 +923,19 @@ fn marks_and_models(h: &mut H) {
     let helped = h.until("marks.md", 10.0, |t| t.contains("<< /help:"));
     h.check("marks set in the config are the marks: !!help is a command and its reply is <<", helped, h.note("marks.md"));
     std::fs::write(&cfg, before).unwrap();
+
+    // A prompt on the last line, with no newline after it, under a blank line.
+    let (tx, rx) = mpsc::channel();
+    h.t3.next(move |t| {
+        tx.send(std::fs::read_to_string(t.folder.join("edge.md")).unwrap_or_default()).unwrap();
+        said("^> ok")
+    });
+    h.ask("edge.md", "Title\n\n^ say ok", "^ say ok");
+    h.until("edge.md", 10.0, |t| t.contains("^> ok"));
+    h.idle();
+    let seen = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+    h.check("a last-line prompt's status takes its place exactly, and the blank line above stays",
+        seen.starts_with("Title\n\n^ ◌ p") && !seen.ends_with('\n') && h.note("edge.md") == "Title\n\n^> ok", (&seen, h.note("edge.md")));
 
     let models = h.state.join("models.json");
     let mut m: Value = serde_json::from_str(&std::fs::read_to_string(&models).unwrap()).unwrap();

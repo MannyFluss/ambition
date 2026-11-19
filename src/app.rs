@@ -66,7 +66,7 @@ between threads. It cannot stop or start them.
 ";
 
 pub fn log(msg: &str) {
-    println!("{} {msg}", now());
+    println!("{} {msg}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"));
 }
 
 /// One prompt on its way to the agent.
@@ -303,7 +303,10 @@ impl App {
         let cwd = req["cwd"].as_str().map(PathBuf::from).and_then(|p| std::fs::canonicalize(p).ok());
         let r = match req["op"].as_str().unwrap_or("") {
             "press" => match (req["file"].as_str(), req["line"].as_u64()) {
-                (Some(f), Some(l)) => self.press(f, l as usize),
+                (Some(f), Some(l)) => {
+                    log(&format!("a press at {}:{l}", util::tilde(Path::new(f))));
+                    self.press(f, l as usize)
+                }
                 _ => Err("a press names a file and a line".into()),
             },
             "more" => {
@@ -404,18 +407,19 @@ impl App {
         self.decide(answer, &util::tilde(root), &how, || config::allow(root))
     }
 
-    /// Ask for an app's grant, for its text fields.
-    fn grant_app(&self, s: &Snapshot) -> Result<(), String> {
+    /// Ask for an app's grant, for its text fields. The first thing a press
+    /// in a field does, before it reads anything.
+    pub fn grant_app(&self, app: &str, bundle: &str) -> Result<(), String> {
         let _one = self.dialog.lock().unwrap();
-        if config::app_allowed(&s.bundle) {
+        if config::app_allowed(bundle) {
             return Ok(());
         }
-        let how = format!("To let presses in {} run without asking: ambition allow {}{}", s.app, config::APP, s.bundle);
-        let text = format!("A press in {} would send the text around your cursor to an agent with a shell.\n\n\
-            Always lets every press in {}'s text fields run without asking, and lets the agent read and look at the window \
-            it was pressed in.", s.app, s.app);
-        let answer = ui::ask(&format!("Let Ambition work in {}?", s.app), &text);
-        self.decide(answer, &s.app, &how, || config::allow_app(&s.bundle))
+        let how = format!("To let presses in {app} run without asking: ambition allow {}{bundle}", config::APP);
+        let text = format!("A press in {app} would send the text around your cursor to an agent with a shell.\n\n\
+            Always lets every press in {app}'s text fields run without asking, and lets the agent read and look at the window \
+            it was pressed in.");
+        let answer = ui::ask(&format!("Let Ambition work in {app}?"), &text);
+        self.decide(answer, app, &how, || config::allow_app(bundle))
     }
 
     /// What a grant dialog's answer means for the press.
@@ -438,6 +442,11 @@ impl App {
     /// A press on `line` (1-based) of `file`.
     pub fn press(self: &Arc<Self>, file: &str, line: usize) -> Result<String, String> {
         let doc = std::fs::canonicalize(file).map_err(|_| format!("{file}: no such file."))?;
+        // The grant comes first, before anything is read or kept.
+        let (root, allowed) = config::place(&doc);
+        if !allowed {
+            self.grant(&doc, &root)?;
+        }
         let meta = std::fs::metadata(&doc).map_err(|e| e.to_string())?;
         if !meta.is_file() {
             return Err(format!("{} is not a file.", util::tilde(&doc)));
@@ -465,10 +474,6 @@ impl App {
         }
         C::reload();
         let what = C::pressed(&name, lines[line - 1], line)?;
-        let (root, allowed) = config::place(&doc);
-        if !allowed {
-            self.grant(&doc, &root)?;
-        }
         let place = self.place(&root)?;
         let rel = place.f.rel(&doc).unwrap_or(name.clone());
         self.busy_here(&place, &doc)?;
@@ -513,7 +518,7 @@ impl App {
         let found = {
             let mut f = self.fields.lock().unwrap();
             match f.get_mut(doc) {
-                Some(l) if l.shown == text && (l.pending.is_some() || l.span.is_some()) => {
+                Some(l) if l.shown == text && (l.pending.is_some() || (l.span.is_some() && surface.can_highlight())) => {
                     l.surface = surface.clone();
                     Some((l.pending.clone(), l.span))
                 }
@@ -557,20 +562,23 @@ impl App {
         };
         let (cleared, gone) = C::clear_replies(rel, &text, true);
         let start = diff::remap(&text, &cleared, p.start);
-        let (stripped, at) = if request {
-            (cleared.clone(), start)
-        } else {
-            let (s, pos) = C::remove(&cleared, &[(start, start + (p.end - p.start))]);
-            (s, pos[0])
-        };
         let status = C::status_line(&p.lead, &id, &status_words(&p.text, &state));
-        let shown = C::insert(&stripped, at, &[status]);
+        let shown = if request {
+            C::insert(&cleared, start, &[status])
+        } else {
+            // The status line takes the prompt's place, exactly there.
+            let mut ls: Vec<&str> = cleared.split('\n').collect();
+            let end = (start + (p.end - p.start)).min(ls.len());
+            ls.splice(start.min(end)..end, [status.as_str()]);
+            ls.join("\n")
+        };
         place.f.write(rel, &shown);
         // In a field, the status line must reach the field before anything is sent.
         if let Err(e) = self.push(doc, &shown, false, None) {
             place.f.write(rel, &text);
             return Err(format!("nothing was sent: Ambition could not write in the field ({e})."));
         }
+        log(&format!("{id}: its status line is in {}", util::tilde(doc)));
         drop(io);
         if !gone.is_empty() {
             place.f.history(&format!("## {} · {rel} · cleared\n{}", now(), gone.join("\n")));
@@ -737,7 +745,8 @@ impl App {
                     f.write(&a.rel, &t0);
                     f.track(&a.rel);
                     f.commit(&format!("Ambition: pressed {} in {}", a.id, a.rel));
-                    let t1 = C::insert(&t0, i, &[working]);
+                    lines.insert(i, &working);
+                    let t1 = lines.join("\n");
                     f.write(&a.rel, &t1);
                     Some((i, t1))
                 }
@@ -1061,7 +1070,8 @@ impl App {
     // ---------- fields ----------
 
     /// A press in a text field. `snap` is what the field said; `surface`
-    /// reaches it again.
+    /// reaches it again. The caller has asked for the app's grant
+    /// (`grant_app`) before reading the field.
     pub fn field_press(self: &Arc<Self>, snap: Snapshot, surface: Arc<dyn Surface>) -> Result<String, String> {
         C::reload();
         let (dir, name) = field::mirror(&snap);
@@ -1085,9 +1095,6 @@ impl App {
         let lines: Vec<&str> = snap.text.split('\n').collect();
         let i = snap.line.min(lines.len().saturating_sub(1));
         let what = C::pressed(&name, lines[i], i + 1)?;
-        if !config::app_allowed(&snap.bundle) {
-            self.grant_app(&snap)?;
-        }
         let place = self.place(&dir)?;
         self.busy_here(&place, &doc)?;
         {

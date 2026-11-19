@@ -44,6 +44,11 @@ pub trait Surface: Send + Sync {
     /// Highlight `span` again (UTF-16 offsets in `text`), if the field still
     /// says `text` and is where it was.
     fn highlight(&self, text: &str, span: (usize, usize)) -> Result<(), String>;
+    /// Whether it can highlight at all. Where it cannot (Zed), a second press
+    /// is a press like any other.
+    fn can_highlight(&self) -> bool {
+        true
+    }
     /// The visible text of the field's window.
     fn window_text(&self) -> Result<String, String>;
     /// A screenshot of the field's window, saved at `out`.
@@ -65,12 +70,15 @@ pub fn blank(text: &str) -> bool {
 /// A window title without the counts apps put in it ("(3) Inbox", "All
 /// iCloud – 116 notes"), so a new message does not make it another field.
 pub fn clean_title(title: &str) -> String {
+    let words: Vec<&str> = title.split_whitespace().collect();
+    let number = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.') && w.chars().any(|c| c.is_ascii_digit());
     let mut out = String::new();
-    for word in title.split_whitespace() {
-        let inner = word.trim_matches(|c: char| "()[]{}".contains(c));
-        let count = !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.')
-            && inner.chars().any(|c| c.is_ascii_digit());
-        if count {
+    for (k, word) in words.iter().enumerate() {
+        // "(3)" and "[12]" are counts; so is a number with a word after it
+        // ("116 notes"). A number that ends the title is a name ("Untitled 2").
+        let bracketed = word.len() > 2 && word.starts_with(['(', '[']) && word.ends_with([')', ']']) && number(&word[1..word.len() - 1]);
+        let counted = number(word) && words.get(k + 1).is_some_and(|n| n.chars().next().is_some_and(char::is_alphabetic));
+        if bracketed || counted {
             continue;
         }
         if !out.is_empty() {
@@ -230,6 +238,7 @@ mod tests {
         assert_eq!(clean_title("All iCloud – 116 notes"), "All iCloud – notes");
         assert_eq!(clean_title("Inbox (8,957) - Gmail"), "Inbox - Gmail");
         assert_eq!(clean_title("Chapter two"), "Chapter two");
+        assert_eq!(clean_title("Untitled 2"), "Untitled 2");
     }
 
     #[test]

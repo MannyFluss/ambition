@@ -31,6 +31,8 @@ use std::time::Duration;
 
 pub struct Editor {
     pub client: String,
+    /// Whether the editor shows a range it is asked to (window/showDocument).
+    shows: bool,
     out: Mutex<TcpStream>,
     open: Mutex<BTreeSet<PathBuf>>,
     pending: Mutex<HashMap<u64, Sender<Value>>>,
@@ -77,6 +79,7 @@ impl Editors {
         }
         let ed = Arc::new(Editor {
             client: hello["client"].as_str().filter(|c| !c.is_empty()).unwrap_or("your editor").to_string(),
+            shows: hello["shows"].as_bool() == Some(true),
             out: Mutex::new(out),
             open: Mutex::new(BTreeSet::new()),
             pending: Mutex::new(HashMap::new()),
@@ -211,6 +214,10 @@ impl Surface for Buffer {
     fn highlight(&self, text: &str, span: (usize, usize)) -> Result<(), String> {
         let t16: Vec<u16> = text.encode_utf16().collect();
         self.ask(json!({"show": self.path, "text": text, "span": lsp_range(&t16, span.0, span.1)})).map(|_| ())
+    }
+
+    fn can_highlight(&self) -> bool {
+        self.ed.shows
     }
 
     fn window_text(&self) -> Result<String, String> {

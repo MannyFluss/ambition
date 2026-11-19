@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Keeps Ambition running: copy to ~/Library/LaunchAgents/com.you.ambition.plist,
+     put your home folder for YOU, and load it once:
+     launchctl load ~/Library/LaunchAgents/com.you.ambition.plist
+     The job starts the binary inside Ambition.app, so macOS knows it as Ambition
+     and its Accessibility grant applies. -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.you.ambition</string>
+  <key>ProgramArguments</key><array><string>/Users/YOU/Applications/Ambition.app/Contents/MacOS/ambition</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict></plist>

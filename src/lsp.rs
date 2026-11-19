@@ -72,6 +72,7 @@ pub fn main() {
     });
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
+    let mut last_try = std::time::Instant::now() - Duration::from_secs(60);
     while let Some(msg) = read_message(&mut input) {
         let method = msg["method"].as_str().unwrap_or("").to_string();
         if method == "exit" {
@@ -94,9 +95,12 @@ pub fn main() {
             let s3 = s.clone();
             std::thread::spawn(move || s3.connect());
         }
-        let opened = method == "textDocument/didOpen";
+        let touched = method == "textDocument/didOpen" || method == "textDocument/didChange";
         s.handle(&msg);
-        if opened && s.bridge.lock().unwrap().is_none() {
+        // Find the running Ambition again when it was not there, or restarted:
+        // on opening or typing, at most every two seconds.
+        if touched && s.bridge.lock().unwrap().is_none() && last_try.elapsed() > Duration::from_secs(2) {
+            last_try = std::time::Instant::now();
             let s4 = s.clone();
             std::thread::spawn(move || s4.connect());
         }
@@ -114,7 +118,8 @@ impl Server {
         }
         let Some((addr, token)) = crate::inbox::location() else { return };
         let Ok(mut c) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)) else { return };
-        let hello = json!({"op": "editor", "token": token, "client": self.client.lock().unwrap().clone()});
+        let hello = json!({"op": "editor", "token": token, "client": self.client.lock().unwrap().clone(),
+            "shows": *self.shows.lock().unwrap()});
         if writeln!(c, "{hello}").is_err() {
             return;
         }

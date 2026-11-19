@@ -257,21 +257,26 @@ impl AxField {
         string(&self.el, "AXValue").map(|v| field::normalize(&v)).ok_or(format!("the field in {} is gone.", self.name))
     }
 
-    /// Wait for the field to say something other than `before`.
-    fn changed_from(&self, before: &str) -> bool {
+    /// Wait for the field to say something other than `before`, and to stay
+    /// so for a moment (web editors tidy up just after a paste). What it says.
+    fn settled_from(&self, before: &str) -> Option<String> {
         let end = Instant::now() + Duration::from_millis(1500);
+        let mut last: Option<String> = None;
         while Instant::now() < end {
-            if self.value().is_ok_and(|v| v != before) {
-                return true;
+            std::thread::sleep(Duration::from_millis(60));
+            let v = self.value().ok()?;
+            if v != before && last.as_deref() == Some(v.as_str()) {
+                return Some(v);
             }
-            std::thread::sleep(Duration::from_millis(15));
+            last = Some(v);
         }
-        false
+        last.filter(|v| v != before)
     }
 
     /// Select `span` (UTF-16 in `text`, what the field says) for a moment,
     /// then put the cursor at its end. A key pressed meanwhile ends it at
-    /// once, so it never types over the selection.
+    /// once, so it never types over the selection; a click leaves the cursor
+    /// where you put it.
     fn flash(&self, text: &str, span: (usize, usize)) {
         let t16: Vec<u16> = text.encode_utf16().collect();
         let Some(map) = offsets(&self.el, &t16) else { return };
@@ -280,13 +285,30 @@ impl AxField {
             return;
         }
         let el = self.el.clone();
-        input::watch(Duration::from_millis(1100), Box::new(move || {
+        let acted = input::watch(Duration::from_millis(1100), Box::new(move || {
             set_range(&el, b, 0);
         }));
-        if range(&self.el) == Some(CFRange { location: a as isize, length: (b - a) as isize }) {
-            set_range(&self.el, b, 0);
+        if acted == input::Acted::Click {
+            return;
+        }
+        // Never leave text selected: where the field will not take the
+        // cursor, the right arrow puts it at the end of the selection.
+        set_range(&self.el, b, 0);
+        std::thread::sleep(Duration::from_millis(60));
+        if range(&self.el).is_some_and(|r| r.length > 0) && self.here().is_ok() {
+            input::key(124, 0);
         }
     }
+}
+
+/// Two texts the same to the eye: web editors keep zero-width characters,
+/// and Google Docs leaves empty paragraphs out of what it shows.
+fn alike(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        let t: String = s.chars().filter(|c| !matches!(c, '\u{feff}' | '\u{200b}')).collect();
+        t.split('\n').filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join("\n")
+    };
+    norm(a) == norm(b)
 }
 
 impl Surface for AxField {
@@ -319,18 +341,38 @@ impl Surface for AxField {
             if clip.is_none() {
                 clip = Some(input::Clip::save());
             }
+            // A web editor takes a new selection a moment after it is set:
+            // select again, wait, and check, so the paste lands on it.
+            set_range(&self.el, a, b - a);
+            std::thread::sleep(Duration::from_millis(200));
             self.here()?;
+            if self.value()? != before {
+                return Err(format!("the field in {} changed while Ambition wrote.", self.name));
+            }
             if h.text.is_empty() {
                 input::key(51, 0);
             } else {
                 input::paste(&h.text);
             }
-            if !self.changed_from(&before) {
-                return Err(format!("the field in {} did not take the text.", self.name));
+            let after = self.settled_from(&before).ok_or(format!("the field in {} did not take the text.", self.name))?;
+            let mut want: Vec<u16> = before.encode_utf16().collect();
+            want.splice(h.at..h.at + h.len, h.text.encode_utf16());
+            if !alike(&after, &String::from_utf16_lossy(&want)) {
+                // Not where it belongs: take it back at once.
+                input::key(6, kCGEventFlagMaskCommand); // ⌘Z
+                let back = self.settled_from(&after).is_some_and(|v| alike(&v, &before));
+                return Err(if back {
+                    format!("the field in {} put the text in the wrong place, so Ambition took it back.", self.name)
+                } else {
+                    format!("the field in {} put the text in the wrong place. Press ⌘Z there to take it back.", self.name)
+                });
             }
         }
         drop(clip);
         let typed = hold.release();
+        if typed > 0 {
+            crate::app::log(&format!("held {typed} of your keys and clicks while writing in {}, then let them go", self.name));
+        }
         let fin = self.value()?;
         if mark && typed == 0 {
             self.flash(&fin, field::changed(&now, &fin));
