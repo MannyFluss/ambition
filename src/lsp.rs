@@ -48,6 +48,8 @@ struct Doc {
     /// The file's name, which says how its carets are written.
     rel: String,
     path: PathBuf,
+    /// The editor's version of this text.
+    version: i64,
 }
 
 struct Server {
@@ -59,6 +61,8 @@ struct Server {
     client: Mutex<String>,
     /// Whether the editor shows a range it is asked to (window/showDocument).
     shows: Mutex<bool>,
+    /// Whether the editor takes edits tied to a version of the text.
+    versioned: Mutex<bool>,
     /// The line to the running Ambition, when there is one.
     bridge: Mutex<Option<std::net::TcpStream>>,
     /// Our requests to the editor, waiting for its answer.
@@ -68,7 +72,7 @@ struct Server {
 pub fn main() {
     let s = Arc::new(Server {
         out: Mutex::new(std::io::stdout()), docs: Mutex::new(HashMap::new()), inlay_refresh: Mutex::new(false), n: Mutex::new(0),
-        client: Mutex::new(String::new()), shows: Mutex::new(false), bridge: Mutex::new(None), waiting: Mutex::new(HashMap::new()),
+        client: Mutex::new(String::new()), shows: Mutex::new(false), versioned: Mutex::new(false), bridge: Mutex::new(None), waiting: Mutex::new(HashMap::new()),
     });
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
@@ -119,7 +123,7 @@ impl Server {
         let Some((addr, token)) = crate::inbox::location() else { return };
         let Ok(mut c) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)) else { return };
         let hello = json!({"op": "editor", "token": token, "client": self.client.lock().unwrap().clone(),
-            "shows": *self.shows.lock().unwrap()});
+            "shows": *self.shows.lock().unwrap(), "versioned": *self.versioned.lock().unwrap()});
         if writeln!(c, "{hello}").is_err() {
             return;
         }
@@ -164,8 +168,13 @@ impl Server {
     }
 
     fn uri_of(&self, path: &str) -> Option<(String, String)> {
+        self.doc_of(path).map(|(u, t, _)| (u, t))
+    }
+
+    /// A file's open buffer: its uri, its text, and the editor's version of it.
+    fn doc_of(&self, path: &str) -> Option<(String, String, i64)> {
         let p = PathBuf::from(path);
-        self.docs.lock().unwrap().iter().find(|(_, d)| d.path == p).map(|(u, d)| (u.clone(), d.text.clone()))
+        self.docs.lock().unwrap().iter().find(|(_, d)| d.path == p).map(|(u, d)| (u.clone(), d.text.clone(), d.version))
     }
 
     /// Ask the editor something and wait for its answer.
@@ -205,11 +214,18 @@ impl Server {
             };
         }
         if let Some(p) = req["edit"].as_str() {
-            let Some((uri, text)) = self.uri_of(p) else { return no("that file is not open here any more.") };
+            let Some((uri, text, version)) = self.doc_of(p) else { return no("that file is not open here any more.") };
             if Some(text.as_str()) != req["old"].as_str() {
                 return no("the buffer changed since Ambition last read it.");
             }
-            let edit = json!({"label": "Ambition", "edit": {"changes": {uri.clone(): req["edits"]}}});
+            // Tied to the version just checked, the editor places the edits on
+            // that text even if a key it has not told us about came since.
+            let edit = if *self.versioned.lock().unwrap() {
+                json!({"label": "Ambition", "edit": {"documentChanges": [
+                    {"textDocument": {"uri": uri.clone(), "version": version}, "edits": req["edits"]}]}})
+            } else {
+                json!({"label": "Ambition", "edit": {"changes": {uri.clone(): req["edits"]}}})
+            };
             let r = self.request("workspace/applyEdit", edit);
             if r.as_ref().map(|r| r["result"]["applied"].as_bool() == Some(true)) != Some(true) {
                 return no("the editor did not take the edit.");
@@ -462,6 +478,7 @@ impl Server {
                 *self.inlay_refresh.lock().unwrap() = p["capabilities"]["workspace"]["inlayHint"]["refreshSupport"].as_bool() == Some(true);
                 *self.client.lock().unwrap() = p["clientInfo"]["name"].as_str().unwrap_or("").to_string();
                 *self.shows.lock().unwrap() = p["capabilities"]["window"]["showDocument"]["support"].as_bool() == Some(true);
+                *self.versioned.lock().unwrap() = p["capabilities"]["workspace"]["workspaceEdit"]["documentChanges"].as_bool() == Some(true);
                 self.respond(&id.unwrap_or(json!(0)), json!({"capabilities": {
                     "positionEncoding": "utf-16",
                     "textDocumentSync": {"openClose": true, "change": 1, "save": false},
@@ -493,7 +510,8 @@ impl Server {
                 if method == "textDocument/didOpen" {
                     self.up(json!({"open": path}));
                 }
-                self.docs.lock().unwrap().insert(uri.clone(), Doc { text, rel, path });
+                let version = p["textDocument"]["version"].as_i64().unwrap_or(0);
+                self.docs.lock().unwrap().insert(uri.clone(), Doc { text, rel, path, version });
                 self.publish(&uri);
             }
             "textDocument/didClose" => {

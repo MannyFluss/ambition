@@ -87,7 +87,8 @@ impl Editors {
             alive: AtomicBool::new(true),
         });
         self.0.lock().unwrap().push(ed.clone());
-        crate::app::log(&format!("{}'s language server is connected", ed.client));
+        crate::app::log(&format!("{}'s language server is connected{}", ed.client,
+            if hello["versioned"].as_bool() == Some(true) { " (its edits are tied to a version of the text)" } else { "" }));
         for line in BufReader::new(read).lines() {
             let Ok(line) = line else { break };
             let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);

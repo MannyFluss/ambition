@@ -695,6 +695,8 @@ fn ambition_only(h: &mut H) {
     });
     h.ask("notes.md", "Cut.\n^ this will be cut off\n", "^ this will be cut off");
     h.until("notes.md", 10.0, |t| t.contains('◌'));
+    // Only once the turn has reached T3, or its script waits for the next turn.
+    wait(10.0, || h.t3.running());
     h.restart();
     let back = h.until("notes.md", 10.0, |t| t.contains("Cut.\n^ this will be cut off\n^> p") && t.contains("was cut off when Ambition stopped"));
     h.check("a prompt cut off by a stop is put back, ready to press again", back, h.note("notes.md"));
@@ -889,28 +891,60 @@ fn buffers(h: &mut H) {
     h.check("and the text around it is left as it was", ed.text(&essay).ends_with("who they love.\n\nThe end.\n"), ed.text(&essay));
     h.idle();
 
-    // Typing during the turn: nothing is overwritten.
-    let (tx, rx) = mpsc::channel::<()>();
+    // Typing while the press waits behind another turn is kept: the turn
+    // takes the buffer as it is when it starts, and the agent edits that.
+    let (slow_tx, slow_rx) = mpsc::channel::<()>();
+    h.t3.next(move |_| {
+        let _ = slow_rx.recv_timeout(Duration::from_secs(10));
+        said("^> slow done")
+    });
     h.t3.next(move |t| {
         let copy = copy_named(&t.message);
         let text = std::fs::read_to_string(&copy).unwrap_or_default();
         std::fs::write(&copy, text.replace("The end\n", "The very end.\n")).unwrap();
-        let _ = rx.recv_timeout(Duration::from_secs(5));
+        said("Done.")
+    });
+    h.save("slow.md", "^ take your time\n");
+    h.fire("slow.md", "^ take your time");
+    wait(10.0, || h.t3.running());
+    let changed = ed.text(&essay).replace("The end.", "The end");
+    ed.type_in(&essay, &changed);
+    let (ok, out) = h.fire_at("essay.md", 5);
+    let waiting = wait(5.0, || ed.text(&essay).contains("· waiting for"));
+    let typed = format!("{}More of my own words.\n", ed.text(&essay));
+    ed.type_in(&essay, &typed);
+    slow_tx.send(()).unwrap();
+    let done = wait(10.0, || ed.text(&essay).contains("The very end.") && !ed.text(&essay).contains('◌'));
+    h.idle();
+    h.check("typing while a press waits is kept, and the agent's edit lands beside it",
+        ok && waiting && done && ed.text(&essay).ends_with("The very end.\nMore of my own words.\n"), (&out, ed.text(&essay)));
+
+    // Typing after the agent has the press is never overwritten: nothing is
+    // written, and Ambition says why (a notice on a Mac; the log everywhere).
+    let (started_tx, started_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    h.t3.next(move |t| {
+        let copy = copy_named(&t.message);
+        let text = std::fs::read_to_string(&copy).unwrap_or_default();
+        std::fs::write(&copy, text.replace("More of my own words.", "More of their words.")).unwrap();
+        started_tx.send(()).unwrap();
+        let _ = go_rx.recv_timeout(Duration::from_secs(10));
         said("Done.")
     });
     std::fs::write(h.root.join("dialog.told"), "").unwrap();
-    // Typed since the last answer, so this press is a new turn.
-    let changed = ed.text(&essay).replace("The end.", "The end");
-    ed.type_in(&essay, &changed);
-    let (ok, _) = h.fire_at("essay.md", 5);
-    wait(5.0, || ed.text(&essay).contains('◌'));
-    let typed = format!("{}More of my own words.\n", ed.text(&essay));
+    let before = ed.text(&essay).replace("words.\n", "words\n");
+    ed.type_in(&essay, &before);
+    let (ok, _) = h.fire_at("essay.md", 6);
+    let started = started_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+    let typed = format!("{}And then some.\n", ed.text(&essay));
     ed.type_in(&essay, &typed);
-    tx.send(()).unwrap();
+    go_tx.send(()).unwrap();
     h.idle();
-    let told = std::fs::read_to_string(h.root.join("dialog.told")).unwrap_or_default();
-    h.check("when the buffer changed during the turn, nothing is written and Ambition says why",
-        ok && ed.text(&essay) == typed && told.contains("is ready, but not in TestEd"), (ed.text(&essay), told));
+    let told = h.output().contains("told: p") && h.output().contains("is ready, but not in TestEd");
+    let shown = !cfg!(target_os = "macos")
+        || std::fs::read_to_string(h.root.join("dialog.told")).unwrap_or_default().contains("is ready, but not in TestEd");
+    h.check("typing during the turn is never overwritten: nothing is written, and Ambition says why",
+        ok && started && ed.text(&essay) == typed && told && shown, (ed.text(&essay), told, shown));
     h.save("essay.md", disk);
 }
 
