@@ -29,6 +29,12 @@ pub fn path() -> PathBuf {
 /// What answers a request.
 pub type Handler = Arc<dyn Fn(&Value) -> Value + Send + Sync>;
 
+/// What takes an editor's connection (`editor.rs`): `{"op": "editor"}`
+/// keeps it open, one line each way, instead of one answer.
+pub type EditorHandler = Box<dyn Fn(TcpStream, &Value) + Send + Sync>;
+
+pub static EDITORS: std::sync::OnceLock<EditorHandler> = std::sync::OnceLock::new();
+
 pub struct Inbox {
     listener: TcpListener,
     token: String,
@@ -78,6 +84,12 @@ fn answer(mut conn: TcpStream, token: &str, h: &Handler) {
         return;
     }
     let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+    if req["op"].as_str() == Some("editor") && req["token"].as_str() == Some(token) {
+        if let Some(h) = EDITORS.get() {
+            let _ = conn.set_read_timeout(None);
+            return h(conn, &req);
+        }
+    }
     let out = if req["token"].as_str() != Some(token) {
         no("the inbox turned this away: wrong token")
     } else {
@@ -89,14 +101,19 @@ fn answer(mut conn: TcpStream, token: &str, h: &Handler) {
     let _ = conn.write_all(format!("{out}\n").as_bytes());
 }
 
+/// Where the running Ambition listens, and its token.
+pub fn location() -> Option<(std::net::SocketAddr, String)> {
+    let text = std::fs::read_to_string(path()).ok()?;
+    let (addr, token) = text.trim().split_once(' ')?;
+    Some((addr.parse().ok()?, token.to_string()))
+}
+
 /// Post a request to the running Ambition and wait up to `wait` for its
 /// answer: (ok, text).
 pub fn send(mut req: Value, wait: Duration) -> Result<(bool, String), String> {
     let down = "Ambition is not running. Start it with `ambition`.";
-    let text = std::fs::read_to_string(path()).map_err(|_| down.to_string())?;
-    let (addr, token) = text.trim().split_once(' ').ok_or(down)?;
+    let (addr, token) = location().ok_or(down)?;
     req["token"] = json!(token);
-    let addr: std::net::SocketAddr = addr.parse().map_err(|_| down.to_string())?;
     let mut c = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(|_| down.to_string())?;
     let _ = c.set_read_timeout(Some(wait));
     c.write_all(format!("{req}\n").as_bytes()).map_err(|e| format!("cannot reach Ambition: {e}"))?;

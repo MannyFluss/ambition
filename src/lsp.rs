@@ -4,6 +4,12 @@
 //! `models.json` and `threads`. It never writes a file, never calls a model,
 //! and never sends anything: only a press does.
 //!
+//! It is also the running Ambition's way into your open buffers
+//! (`editor.rs`): it keeps a line open to it, says which files are open,
+//! gives a buffer's unsaved text when a press asks, and puts Ambition's
+//! changes in with `workspace/applyEdit`, only the ranges that change, so the
+//! buffer stays unsaved and the editor's undo takes them back.
+//!
 //! - Colors (semantic tokens): `^` prompts, `^/` commands, `^>` replies, and
 //!   status lines.
 //! - Completion: command names after `^/`, models after `^/model `, efforts
@@ -49,10 +55,21 @@ struct Server {
     docs: Mutex<HashMap<String, Doc>>,
     inlay_refresh: Mutex<bool>,
     n: Mutex<u64>,
+    /// The editor's name, from `initialize`.
+    client: Mutex<String>,
+    /// Whether the editor shows a range it is asked to (window/showDocument).
+    shows: Mutex<bool>,
+    /// The line to the running Ambition, when there is one.
+    bridge: Mutex<Option<std::net::TcpStream>>,
+    /// Our requests to the editor, waiting for its answer.
+    waiting: Mutex<HashMap<String, std::sync::mpsc::Sender<Value>>>,
 }
 
 pub fn main() {
-    let s = Arc::new(Server { out: Mutex::new(std::io::stdout()), docs: Mutex::new(HashMap::new()), inlay_refresh: Mutex::new(false), n: Mutex::new(0) });
+    let s = Arc::new(Server {
+        out: Mutex::new(std::io::stdout()), docs: Mutex::new(HashMap::new()), inlay_refresh: Mutex::new(false), n: Mutex::new(0),
+        client: Mutex::new(String::new()), shows: Mutex::new(false), bridge: Mutex::new(None), waiting: Mutex::new(HashMap::new()),
+    });
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     while let Some(msg) = read_message(&mut input) {
@@ -60,12 +77,172 @@ pub fn main() {
         if method == "exit" {
             break;
         }
+        if method.is_empty() {
+            // The editor's answer to one of our requests.
+            let id = match &msg["id"] {
+                Value::String(x) => x.clone(),
+                v => v.to_string(),
+            };
+            if let Some(tx) = s.waiting.lock().unwrap().remove(&id) {
+                let _ = tx.send(msg);
+            }
+            continue;
+        }
         if method == "initialized" {
             let s2 = s.clone();
             std::thread::spawn(move || s2.watch_state());
+            let s3 = s.clone();
+            std::thread::spawn(move || s3.connect());
         }
+        let opened = method == "textDocument/didOpen";
         s.handle(&msg);
+        if opened && s.bridge.lock().unwrap().is_none() {
+            let s4 = s.clone();
+            std::thread::spawn(move || s4.connect());
+        }
     }
+}
+
+impl Server {
+    /// Open the line to the running Ambition, if it runs, and say which
+    /// files are open. Then answer its requests until the line closes.
+    fn connect(self: Arc<Self>) {
+        use std::io::{BufReader, Write as _};
+        let mut b = self.bridge.lock().unwrap();
+        if b.is_some() {
+            return;
+        }
+        let Some((addr, token)) = crate::inbox::location() else { return };
+        let Ok(mut c) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)) else { return };
+        let hello = json!({"op": "editor", "token": token, "client": self.client.lock().unwrap().clone()});
+        if writeln!(c, "{hello}").is_err() {
+            return;
+        }
+        let Ok(read) = c.try_clone() else { return };
+        let mut r = BufReader::new(read);
+        let mut line = String::new();
+        let _ = c.set_read_timeout(Some(Duration::from_secs(3)));
+        if r.read_line(&mut line).is_err() || !line.contains("\"ok\":true") {
+            return;
+        }
+        let _ = c.set_read_timeout(None);
+        for d in self.docs.lock().unwrap().values() {
+            let _ = writeln!(c, "{}", json!({"open": d.path}));
+        }
+        *b = Some(c);
+        drop(b);
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+            let me = self.clone();
+            std::thread::spawn(move || {
+                let mut out = me.serve(&req);
+                out["id"] = req["id"].clone();
+                me.up(out);
+            });
+        }
+        *self.bridge.lock().unwrap() = None;
+    }
+
+    /// One line to the running Ambition.
+    fn up(&self, v: Value) {
+        use std::io::Write as _;
+        let mut b = self.bridge.lock().unwrap();
+        if let Some(c) = b.as_mut() {
+            if writeln!(c, "{v}").is_err() {
+                *b = None;
+            }
+        }
+    }
+
+    fn uri_of(&self, path: &str) -> Option<(String, String)> {
+        let p = PathBuf::from(path);
+        self.docs.lock().unwrap().iter().find(|(_, d)| d.path == p).map(|(u, d)| (u.clone(), d.text.clone()))
+    }
+
+    /// Ask the editor something and wait for its answer.
+    fn request(&self, method: &str, params: Value) -> Option<Value> {
+        let id = {
+            let mut n = self.n.lock().unwrap();
+            *n += 1;
+            format!("ambition-{n}")
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.waiting.lock().unwrap().insert(id.clone(), tx);
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        let r = rx.recv_timeout(Duration::from_secs(5)).ok();
+        self.waiting.lock().unwrap().remove(&id);
+        r
+    }
+
+    /// Show a range in the editor for a moment, then put the cursor at its
+    /// end, where the editor can (window/showDocument).
+    fn show(&self, uri: &str, span: &Value) {
+        if !*self.shows.lock().unwrap() {
+            return;
+        }
+        self.request("window/showDocument", json!({"uri": uri, "takeFocus": true, "selection": span}));
+        std::thread::sleep(Duration::from_millis(1000));
+        let end = json!({"start": span["end"], "end": span["end"]});
+        self.request("window/showDocument", json!({"uri": uri, "takeFocus": true, "selection": end}));
+    }
+
+    /// Answer the running Ambition.
+    fn serve(&self, req: &Value) -> Value {
+        let no = |t: &str| json!({"ok": false, "text": t});
+        if let Some(p) = req["read"].as_str() {
+            return match self.uri_of(p) {
+                Some((_, text)) => json!({"ok": true, "text": text}),
+                None => no("that file is not open here any more."),
+            };
+        }
+        if let Some(p) = req["edit"].as_str() {
+            let Some((uri, text)) = self.uri_of(p) else { return no("that file is not open here any more.") };
+            if Some(text.as_str()) != req["old"].as_str() {
+                return no("the buffer changed since Ambition last read it.");
+            }
+            let edit = json!({"label": "Ambition", "edit": {"changes": {uri.clone(): req["edits"]}}});
+            let r = self.request("workspace/applyEdit", edit);
+            if r.as_ref().map(|r| r["result"]["applied"].as_bool() == Some(true)) != Some(true) {
+                return no("the editor did not take the edit.");
+            }
+            let new = apply_edits(&text, req["edits"].as_array().map(Vec::as_slice).unwrap_or(&[]));
+            if req["mark"].as_bool() == Some(true) {
+                self.show(&uri, &req["span"]);
+            }
+            return json!({"ok": true, "text": new});
+        }
+        if let Some(p) = req["show"].as_str() {
+            let Some((uri, text)) = self.uri_of(p) else { return no("that file is not open here any more.") };
+            if Some(text.as_str()) != req["text"].as_str() {
+                return no("the buffer changed.");
+            }
+            self.show(&uri, &req["span"]);
+            return json!({"ok": true});
+        }
+        no("the language server does not know that request.")
+    }
+}
+
+/// LSP TextEdits on `text`, all relative to it, applied.
+fn apply_edits(text: &str, edits: &[Value]) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let offset = |pos: &Value| -> usize {
+        let (l, c) = (pos["line"].as_u64().unwrap_or(0) as usize, pos["character"].as_u64().unwrap_or(0) as u32);
+        let before: usize = lines.iter().take(l).map(|x| x.len() + 1).sum();
+        before + lines.get(l).map(|x| byte_at(x, c)).unwrap_or(0)
+    };
+    let mut spans: Vec<(usize, usize, &str)> = edits.iter()
+        .map(|e| (offset(&e["range"]["start"]), offset(&e["range"]["end"]), e["newText"].as_str().unwrap_or(""))).collect();
+    spans.sort_by_key(|x| std::cmp::Reverse(x.0));
+    let mut out = text.to_string();
+    for (a, b, t) in spans {
+        out.replace_range(a.min(out.len())..b.min(out.len()), t);
+    }
+    out
 }
 
 fn read_message(r: &mut impl BufRead) -> Option<Value> {
@@ -278,6 +455,8 @@ impl Server {
         match method {
             "initialize" => {
                 *self.inlay_refresh.lock().unwrap() = p["capabilities"]["workspace"]["inlayHint"]["refreshSupport"].as_bool() == Some(true);
+                *self.client.lock().unwrap() = p["clientInfo"]["name"].as_str().unwrap_or("").to_string();
+                *self.shows.lock().unwrap() = p["capabilities"]["window"]["showDocument"]["support"].as_bool() == Some(true);
                 self.respond(&id.unwrap_or(json!(0)), json!({"capabilities": {
                     "positionEncoding": "utf-16",
                     "textDocumentSync": {"openClose": true, "change": 1, "save": false},
@@ -306,11 +485,16 @@ impl Server {
                     self.docs.lock().unwrap().get(&uri).map(|d| (d.rel.clone(), d.path.clone()))
                 };
                 let Some((rel, path)) = place else { return };
+                if method == "textDocument/didOpen" {
+                    self.up(json!({"open": path}));
+                }
                 self.docs.lock().unwrap().insert(uri.clone(), Doc { text, rel, path });
                 self.publish(&uri);
             }
             "textDocument/didClose" => {
-                self.docs.lock().unwrap().remove(p["textDocument"]["uri"].as_str().unwrap_or(""));
+                if let Some(d) = self.docs.lock().unwrap().remove(p["textDocument"]["uri"].as_str().unwrap_or("")) {
+                    self.up(json!({"close": d.path}));
+                }
             }
             _ => {
                 let Some(id) = id else { return };

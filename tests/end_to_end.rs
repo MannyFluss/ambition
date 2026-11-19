@@ -42,18 +42,11 @@ impl H {
         std::fs::write(dir.join("readme.md"), "Mine.\n").unwrap();
         git(&dir, &["add", "readme.md"]);
         git(&dir, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "the user's own commit"]);
-        // A stand-in for macOS's dialog: it answers what the file `dialog` says.
-        let bin = root.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let fake = bin.join("osascript");
-        std::fs::write(&fake, "#!/bin/sh\necho asked >> \"$FAKE_DIALOG.log\"\nanswer=$(cat \"$FAKE_DIALOG\" 2>/dev/null || echo Deny)\n\
-            case \"$answer\" in\n  Deny) echo 'execution error: User canceled. (-128)' >&2; exit 1 ;;\n  *) echo \"button returned:$answer, gave up:false\" ;;\nesac\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        // The dialog answers what the file `dialog` says (AMBITION_TEST_DIALOG),
+        // and the global key stays off, so a test never takes the real one.
+        std::fs::create_dir_all(root.join("bin")).unwrap();
         let state = root.join("state");
+        std::fs::write(state.join("config"), "hotkey = none\n").unwrap();
         let child = spawn(&root);
         let h = H { root, dir, state, t3, child, fails: Vec::new() };
         assert!(wait(10.0, || h.state.join("inbox").exists()), "Ambition never started: {}", h.output());
@@ -183,7 +176,7 @@ fn env(root: &Path, c: &mut Command) {
         .env("AMBITION_HOME", root.join("state"))
         .env("T3CODE_HOME", root.join("t3"))
         .env("AMBITION_COMMAND_TIMEOUT", "2")
-        .env("FAKE_DIALOG", root.join("dialog"))
+        .env("AMBITION_TEST_DIALOG", if cfg!(target_os = "macos") { root.join("dialog") } else { PathBuf::new() })
         .env("PATH", path);
 }
 
@@ -249,14 +242,15 @@ fn grants(h: &mut H) {
     h.save("notes.md", first);
     std::thread::sleep(Duration::from_millis(1200));
     h.check("saving a ^ line sends nothing and changes nothing", h.t3.messages().is_empty() && h.note("notes.md") == first, h.t3.messages().len());
-    let (ok, out) = h.fire_at("notes.md", 3);
-    h.check("a press on a line without ^ says so and sends nothing", !ok && out.contains("does not start with ^") && h.t3.messages().is_empty(), &out);
+    let (ok, out) = h.fire_at("notes.md", 5);
+    h.check("a press on a reply-free blank line still asks first, and Deny or no grant sends nothing",
+        !ok && h.t3.messages().is_empty() && h.note("notes.md") == first, &out);
 
     if cfg!(target_os = "macos") {
         h.dialog("Deny");
         let (ok, out) = h.fire("notes.md", "^ make this shorter");
         h.check("the first press in a new folder asks, and Deny sends nothing",
-            !ok && out.contains("denied") && h.dialogs() == 1 && h.t3.messages().is_empty() && h.note("notes.md") == first, (&out, h.dialogs()));
+            !ok && out.contains("denied") && h.dialogs() == if cfg!(target_os = "macos") { 2 } else { 0 } && h.t3.messages().is_empty() && h.note("notes.md") == first, (&out, h.dialogs()));
         h.dialog("Allow once");
     } else {
         let (ok, out) = h.fire("notes.md", "^ make this shorter");
@@ -298,13 +292,17 @@ fn grants(h: &mut H) {
         m0.contains("\n3| A long rambling paragraph") && m0.contains("\n4| ^ ◌ p1 · make this shorter · working") && m0.contains("all 6 lines"),
         &m0[m0.len().saturating_sub(700)..]);
     h.idle();
-    h.check("the turn is one commit", h.log().lines().next().unwrap_or("").contains("agent answered p1 in notes.md"), h.log());
+    let log = h.log();
+    let mut subjects = log.lines();
+    h.check("the turn is one commit, and the whole folder is kept only after it",
+        subjects.next().unwrap_or("").contains("kept the whole folder") && subjects.next().unwrap_or("").contains("agent answered p1 in notes.md")
+            && subjects.next().unwrap_or("").contains("pressed p1 in notes.md") && subjects.next().is_none(), &log);
 
     if cfg!(target_os = "macos") {
         h.dialog("Always");
         h.t3.next(|_| said("^> ok"));
         let (ok, out) = h.ask("notes.md", "Short.\n^ say ok\n", "^ say ok");
-        h.check("Allow once asked again on the next press, and Always lets it through", ok && h.dialogs() == 3, (&out, h.dialogs()));
+        h.check("Allow once asked again on the next press, and Always lets it through", ok && h.dialogs() == 4, (&out, h.dialogs()));
         h.until("notes.md", 10.0, |t| t.contains("^> ok"));
         h.idle();
         let cfg = std::fs::read_to_string(h.state.join("config")).unwrap_or_default();
@@ -346,8 +344,12 @@ fn core(h: &mut H) {
     let dir = h.dir.display().to_string();
     let echoed = h.until("notes.md", 10.0, |t| t.contains(&format!("^> args: a b c | file: notes.md | line: 4 | dir: {dir}")));
     h.check("^/echo gets its words, the file, the line and the folder", echoed, h.note("notes.md"));
-    let (ok, _) = h.fire("notes.md", "# ^/echo nope");
-    h.check("a ^/ line after # in a note is text, not a command", !ok && h.note("notes.md").contains("# ^/echo nope"), h.note("notes.md"));
+    h.t3.next(|_| said("^> that line is a heading"));
+    let (ok, out) = h.fire("notes.md", "# ^/echo nope");
+    let asked = h.until("notes.md", 10.0, |t| t.contains("# ^/echo nope\n^> that line is a heading"));
+    h.check("a ^/ line after # in a note is text: a press on it is a request, not a command",
+        ok && asked && !h.note("notes.md").contains("args: nope"), (&out, h.note("notes.md")));
+    h.idle();
     h.ask("notes.md", "Text.\n\n^/slwo\n", "^/slwo");
     let near = h.until("notes.md", 10.0, |t| t.contains("Did you mean ^/slow?"));
     h.check("an unknown command says so and suggests one", near, h.note("notes.md"));
@@ -722,12 +724,229 @@ fn ambition_only(h: &mut H) {
     h.check("`ambition <folder>` says 0.2 watches no folder", old.status.code() == Some(2) && String::from_utf8_lossy(&old.stderr).contains("watches no folder"), &old);
 }
 
+/// A stand-in for an editor's language server: it holds buffers and takes
+/// Ambition's edits the way `ambition lsp` does.
+struct Ed {
+    out: std::net::TcpStream,
+    texts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    log: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+}
+
+impl Ed {
+    fn connect(state: &Path) -> Ed {
+        use std::io::{BufRead, BufReader, Write};
+        let text = std::fs::read_to_string(state.join("inbox")).unwrap();
+        let (addr, token) = text.trim().split_once(' ').unwrap();
+        let mut out = std::net::TcpStream::connect(addr).unwrap();
+        writeln!(out, "{}", serde_json::json!({"op": "editor", "token": token, "client": "TestEd"})).unwrap();
+        let mut r = BufReader::new(out.try_clone().unwrap());
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        assert!(line.contains("\"ok\":true"), "{line}");
+        let texts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>> = Default::default();
+        let log: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let (t2, l2, mut w) = (texts.clone(), log.clone(), out.try_clone().unwrap());
+        std::thread::spawn(move || {
+            for line in r.lines() {
+                let Ok(line) = line else { break };
+                let req: Value = serde_json::from_str(&line).unwrap();
+                l2.lock().unwrap().push(req.clone());
+                let mut t = t2.lock().unwrap();
+                let reply = if let Some(p) = req["read"].as_str() {
+                    serde_json::json!({"ok": true, "text": t.get(p).cloned().unwrap_or_default()})
+                } else if let Some(p) = req["edit"].as_str() {
+                    let cur = t.get(p).cloned().unwrap_or_default();
+                    if Some(cur.as_str()) != req["old"].as_str() {
+                        serde_json::json!({"ok": false, "text": "the buffer changed"})
+                    } else {
+                        let new = apply(&cur, req["edits"].as_array().unwrap());
+                        t.insert(p.to_string(), new.clone());
+                        serde_json::json!({"ok": true, "text": new})
+                    }
+                } else {
+                    serde_json::json!({"ok": true})
+                };
+                let mut reply = reply;
+                reply["id"] = req["id"].clone();
+                writeln!(w, "{reply}").unwrap();
+            }
+        });
+        Ed { out, texts, log }
+    }
+
+    fn open(&mut self, path: &Path, text: &str) {
+        use std::io::Write;
+        let p = std::fs::canonicalize(path).unwrap().display().to_string();
+        self.texts.lock().unwrap().insert(p.clone(), text.to_string());
+        writeln!(self.out, "{}", serde_json::json!({"open": p})).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    fn text(&self, path: &Path) -> String {
+        let p = std::fs::canonicalize(path).unwrap().display().to_string();
+        self.texts.lock().unwrap().get(&p).cloned().unwrap_or_default()
+    }
+
+    fn type_in(&self, path: &Path, text: &str) {
+        let p = std::fs::canonicalize(path).unwrap().display().to_string();
+        self.texts.lock().unwrap().insert(p, text.to_string());
+    }
+}
+
+/// LSP edits, all on the same text, applied.
+fn apply(text: &str, edits: &[Value]) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let at = |p: &Value| -> usize {
+        let (l, c) = (p["line"].as_u64().unwrap() as usize, p["character"].as_u64().unwrap() as usize);
+        let before: usize = lines.iter().take(l).map(|x| x.len() + 1).sum();
+        let line = lines.get(l).copied().unwrap_or("");
+        let mut n = 0;
+        let mut b = line.len();
+        for (i, ch) in line.char_indices() {
+            if n >= c {
+                b = i;
+                break;
+            }
+            n += ch.len_utf16();
+        }
+        before + b
+    };
+    let mut spans: Vec<(usize, usize, String)> = edits.iter()
+        .map(|e| (at(&e["range"]["start"]), at(&e["range"]["end"]), e["newText"].as_str().unwrap().to_string())).collect();
+    spans.sort_by_key(|x| std::cmp::Reverse(x.0));
+    let mut out = text.to_string();
+    for (a, b, t) in spans {
+        out.replace_range(a..b, &t);
+    }
+    out
+}
+
+/// The copy of a document the press message tells the agent to edit.
+fn copy_named(message: &str) -> PathBuf {
+    let i = message.find("edit its copy, ").expect("the message names a copy") + "edit its copy, ".len();
+    let rest = &message[i..];
+    let path = &rest[..rest.find(", and Ambition").unwrap()];
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(path.replacen('~', &home, 1))
+}
+
+/// A file open in an editor: the press reads the unsaved buffer, the agent
+/// edits a copy, and only the changed range goes back into the buffer. The
+/// file on disk is never written.
+fn buffers(h: &mut H) {
+    let mut ed = Ed::connect(&h.state);
+    let disk = "# Essay\n\nAn old draft on disk.\n";
+    h.save("essay.md", disk);
+    let buffer = "# Essay\n\nWhen we make machines that love, the quik question is who they love.\n^ fix the typo\n\nThe end.\n";
+    ed.open(&h.dir.join("essay.md"), buffer);
+    let (tx, rx) = mpsc::channel();
+    let home = h.root.join("home");
+    h.t3.next(move |t| {
+        let copy = copy_named(&t.message);
+        let copy = if copy.starts_with("~") { home.join(copy.strip_prefix("~").unwrap()) } else { copy };
+        let text = std::fs::read_to_string(&copy).unwrap_or_default();
+        tx.send((t.message.clone(), text.clone())).unwrap();
+        std::fs::write(&copy, text.replace("quik", "quick")).unwrap();
+        said("Fixed the typo on line 3.")
+    });
+    let (ok, out) = h.fire_at("essay.md", 4);
+    let essay = h.dir.join("essay.md");
+    let landed = wait(10.0, || ed.text(&essay).contains("the quick question") && !ed.text(&essay).contains('◌'));
+    h.check("a press in an open buffer reads it unsaved, and the answer lands in the buffer", ok && landed, (&out, ed.text(&essay)));
+    let (msg, seen) = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+    h.check("the agent is told the buffer is open and edits a copy of it, not the file",
+        msg.contains("is open in TestEd, with changes not saved to disk") && seen.contains("^ ◌ p") && seen.contains("the quik question"), &msg);
+    h.check("the file on disk is never written", h.note("essay.md") == disk, h.note("essay.md"));
+    let edits: Vec<Value> = ed.log.lock().unwrap().iter().filter(|r| r["edit"].is_string()).cloned().collect();
+    let last = edits.last().cloned().unwrap_or_default();
+    let small = edits.iter().all(|e| e["edits"].as_array().is_some_and(|x| x.iter().all(|t| t["range"]["start"]["line"].as_u64() >= Some(2))));
+    h.check("only the changed range goes back: the edits never touch the lines above",
+        small && last["edits"][0] == serde_json::json!({"range": {"start": {"line": 2, "character": 37}, "end": {"line": 2, "character": 41}}, "newText": "quick"}), &last);
+    h.idle();
+    let n = h.t3.messages().len();
+    let (ok, out) = h.fire_at("essay.md", 3);
+    std::thread::sleep(Duration::from_millis(300));
+    let shown = ed.log.lock().unwrap().iter().any(|r| r["show"].is_string());
+    h.check("a second press on the unchanged buffer shows the change again and sends nothing",
+        ok && out.contains("showed what Ambition wrote last") && shown && h.t3.messages().len() == n, &out);
+
+    // A press with no mark: a request, its status just below the line.
+    ed.type_in(&essay, "# Essay\n\nWhen we make machines that love, the quick question is who they love\n\nThe end.\n");
+    let (tx, rx) = mpsc::channel();
+    h.t3.next(move |t| {
+        let copy = copy_named(&t.message);
+        let text = std::fs::read_to_string(&copy).unwrap_or_default();
+        tx.send((t.message.clone(), text.clone())).unwrap();
+        std::fs::write(&copy, text.replace("who they love\n", "who they love.\n")).unwrap();
+        said("Ended the sentence.")
+    });
+    let (ok, out) = h.fire_at("essay.md", 3);
+    let done = wait(10.0, || ed.text(&essay).contains("who they love.\n") && !ed.text(&essay).contains('◌'));
+    let (msg, seen) = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+    h.check("a press with no mark is a request: its status goes just below the line, and the agent is told so",
+        ok && done && msg.contains("A press with no mark in ~/notes/essay.md, on line 3: a request")
+            && seen.contains("who they love\n^ ◌ p") , (&out, &msg[..msg.len().min(300)], &seen));
+    h.check("and the text around it is left as it was", ed.text(&essay).ends_with("who they love.\n\nThe end.\n"), ed.text(&essay));
+    h.idle();
+
+    // Typing during the turn: nothing is overwritten.
+    let (tx, rx) = mpsc::channel::<()>();
+    h.t3.next(move |t| {
+        let copy = copy_named(&t.message);
+        let text = std::fs::read_to_string(&copy).unwrap_or_default();
+        std::fs::write(&copy, text.replace("The end\n", "The very end.\n")).unwrap();
+        let _ = rx.recv_timeout(Duration::from_secs(5));
+        said("Done.")
+    });
+    std::fs::write(h.root.join("dialog.told"), "").unwrap();
+    // Typed since the last answer, so this press is a new turn.
+    let changed = ed.text(&essay).replace("The end.", "The end");
+    ed.type_in(&essay, &changed);
+    let (ok, _) = h.fire_at("essay.md", 5);
+    wait(5.0, || ed.text(&essay).contains('◌'));
+    let typed = format!("{}More of my own words.\n", ed.text(&essay));
+    ed.type_in(&essay, &typed);
+    tx.send(()).unwrap();
+    h.idle();
+    let told = std::fs::read_to_string(h.root.join("dialog.told")).unwrap_or_default();
+    h.check("when the buffer changed during the turn, nothing is written and Ambition says why",
+        ok && ed.text(&essay) == typed && told.contains("is ready, but not in TestEd"), (ed.text(&essay), told));
+    h.save("essay.md", disk);
+}
+
+/// Marks are config lines, and new threads start on the last model.
+fn marks_and_models(h: &mut H) {
+    let cfg = h.state.join("config");
+    let before = std::fs::read_to_string(&cfg).unwrap_or_default();
+    std::fs::write(&cfg, format!("{before}ask = >>\nreply = <<\ncommand = !!\n")).unwrap();
+    h.ask("marks.md", "Some text.\n\n!!help\n", "!!help");
+    let helped = h.until("marks.md", 10.0, |t| t.contains("<< /help:"));
+    h.check("marks set in the config are the marks: !!help is a command and its reply is <<", helped, h.note("marks.md"));
+    std::fs::write(&cfg, before).unwrap();
+
+    let models = h.state.join("models.json");
+    let mut m: Value = serde_json::from_str(&std::fs::read_to_string(&models).unwrap()).unwrap();
+    let started = m["started"].clone();
+    m.as_object_mut().unwrap().remove("last");
+    std::fs::write(&models, m.to_string()).unwrap();
+    h.t3.next(|_| said("^> fine"));
+    h.ask("fresh.md", "^ hello\n", "^ hello");
+    h.until("fresh.md", 10.0, |t| t.contains("^> fine"));
+    h.idle();
+    let launched = h.t3.lock().launched.clone();
+    let last = launched.last().cloned().unwrap();
+    h.check("with no model chosen, a new thread starts on the last thread's model, never T3's first",
+        started.is_object() && last.2.as_ref().map(|v| v["model"].clone()) == Some(started["model"].clone()), (&last, &started));
+}
+
 #[test]
 fn ambition_end_to_end() {
     let mut h = H::new();
     grants(&mut h);
     core(&mut h);
     documents(&mut h);
+    buffers(&mut h);
     ambition_only(&mut h);
+    marks_and_models(&mut h);
     h.finish();
 }

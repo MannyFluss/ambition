@@ -1,9 +1,9 @@
 //! Caret lines in a file: finding them, taking them out, and writing status
-//! and reply lines.
+//! and reply lines. This is the one place that knows the marks.
 //!
 //! ```text
-//! ^ tighten this          a prompt. Lines in a row that start with ^ are one
-//!                         prompt.
+//! ^ tighten this          a prompt: look at this specifically. Lines in a row
+//!                         that start with ^ are one prompt.
 //! ^/undo                  a command: answered at once, in code, never sent
 //!                         to the agent. One line each.
 //! ^ ◌ p3 · …              a status line Ambition writes while p3 runs.
@@ -12,16 +12,79 @@
 //!                         delete the ^> to keep the text.
 //! ```
 //!
-//! In notes (`.md`, `.txt`, or no extension) a caret counts only at the very
+//! The marks are config lines (`ask = ^`, `reply = ^>`, `command = ^/`);
+//! those are the defaults. A press on a line with no mark is a request: the
+//! agent reads around it and does what the text seems to need.
+//!
+//! In notes (`.md`, `.txt`, or no extension) a mark counts only at the very
 //! start of a line, so indented examples never fire. In code files it may
 //! follow spaces and a comment marker: `# ^ …`, `// ^ …`, `-- ^ …`, `; ^ …`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 pub const WORKING: char = '◌';
 
-/// A note is prose: carets only at column 0, and a caret under a list means
+/// The three marks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Marks {
+    pub ask: String,
+    pub reply: String,
+    pub command: String,
+}
+
+impl Default for Marks {
+    fn default() -> Marks {
+        Marks { ask: "^".into(), reply: "^>".into(), command: "^/".into() }
+    }
+}
+
+impl Marks {
+    /// Each mark with its kind, the longest first, so `^>` wins over `^`.
+    fn ordered(&self) -> Vec<(&str, u8)> {
+        let mut v = vec![(self.ask.as_str(), b'a'), (self.reply.as_str(), b'r'), (self.command.as_str(), b'c')];
+        v.sort_by_key(|(m, _)| std::cmp::Reverse(m.len()));
+        v
+    }
+
+    fn starts(&self, s: &str) -> bool {
+        [&self.ask, &self.reply, &self.command].iter().any(|m| s.starts_with(m.as_str()))
+    }
+}
+
+static MARKS: RwLock<Option<Arc<Marks>>> = RwLock::new(None);
+
+thread_local! {
+    static MINE: std::cell::RefCell<Option<Arc<Marks>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The marks in use: the config's, read when first asked and again on
+/// `reload`.
+pub fn marks() -> Arc<Marks> {
+    if let Some(m) = MINE.with(|c| c.borrow().clone()) {
+        return m;
+    }
+    if let Some(m) = MARKS.read().unwrap().as_ref() {
+        return m.clone();
+    }
+    reload()
+}
+
+/// Read the marks from the config again. A press does this first, so a
+/// changed config counts from the next press.
+pub fn reload() -> Arc<Marks> {
+    let m = Arc::new(if cfg!(test) { Marks::default() } else { crate::config::marks() });
+    *MARKS.write().unwrap() = Some(m.clone());
+    m
+}
+
+/// Use these marks on this thread only (tests).
+pub fn set_marks(m: Option<Marks>) {
+    MINE.with(|c| *c.borrow_mut() = m.map(Arc::new));
+}
+
+/// A note is prose: marks only at column 0, and a caret under a list means
 /// its last item.
 pub fn is_note(rel: &str) -> bool {
     match Path::new(rel).extension().and_then(|e| e.to_str()) {
@@ -30,11 +93,12 @@ pub fn is_note(rel: &str) -> bool {
     }
 }
 
-/// The byte index of a caret line's `^`, which is also the length of what
-/// comes before it (its lead): nothing in a note; spaces and one comment
-/// marker in code.
+/// The byte index where a caret line's mark starts, which is also the length
+/// of what comes before it (its lead): nothing in a note; spaces and one
+/// comment marker in code.
 pub fn caret_at(rel: &str, line: &str) -> Option<usize> {
-    if line.starts_with('^') {
+    let m = marks();
+    if m.starts(line) {
         return Some(0);
     }
     if is_note(rel) {
@@ -48,12 +112,12 @@ pub fn caret_at(rel: &str, line: &str) -> Option<usize> {
         i
     };
     let mut i = blanks(0);
-    if b.get(i) == Some(&b'^') {
+    if m.starts(&line[i..]) {
         return Some(i);
     }
-    let marker = ["//", "--", "#", ";"].iter().find(|m| line[i..].starts_with(**m))?;
+    let marker = ["//", "--", "#", ";"].iter().find(|mk| line[i..].starts_with(**mk))?;
     i = blanks(i + marker.len());
-    (b.get(i) == Some(&b'^')).then_some(i)
+    m.starts(&line[i..]).then_some(i)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,12 +134,14 @@ pub enum Kind {
 pub fn kind(rel: &str, line: &str) -> Option<(String, Kind)> {
     let at = caret_at(rel, line)?;
     let lead = line[..at].to_string();
-    let after = &line[at + 1..];
-    if after.starts_with('>') {
+    let m = marks();
+    let (mark, which) = m.ordered().into_iter().find(|(mk, _)| line[at..].starts_with(*mk))?;
+    let after = &line[at + mark.len()..];
+    if which == b'r' {
         return Some((lead, Kind::Reply));
     }
-    if let Some(rest) = after.strip_prefix('/') {
-        return Some((lead, command(rest).unwrap_or(Kind::Other)));
+    if which == b'c' {
+        return Some((lead, command(after).unwrap_or(Kind::Other)));
     }
     let working = format!(" {WORKING} ");
     if let Some(rest) = after.strip_prefix(working.as_str()) {
@@ -132,6 +198,28 @@ fn status_id(rest: &str) -> Option<String> {
         return None;
     }
     Some(rest[..i].to_string())
+}
+
+/// What a press on a line does: send a prompt, run a command, or, on a line
+/// with no mark, send a request. Or why it does nothing. Every press, in a
+/// file or a field, is checked here.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pressed {
+    Prompt,
+    Command(String),
+    Request,
+}
+
+pub fn pressed(rel: &str, line: &str, n: usize) -> Result<Pressed, String> {
+    let m = marks();
+    match kind(rel, line) {
+        Some((_, Kind::Prompt(_))) => Ok(Pressed::Prompt),
+        Some((_, Kind::Command { name, .. })) => Ok(Pressed::Command(name)),
+        Some((_, Kind::Status(id))) => Err(format!("{id} is on its way already. Its status line goes when its turn ends.")),
+        Some((_, Kind::Reply)) => Err(format!("line {n} is a reply ({}), not a prompt. The next press here clears it.", m.reply)),
+        Some((_, Kind::Other)) => Err(format!("line {n} has a {} with nothing after it to send.", m.ask)),
+        None => Ok(Pressed::Request),
+    }
 }
 
 /// One prompt: 0-based lines `start..end`, its lead, and its words, one line
@@ -316,7 +404,25 @@ pub fn insert(text: &str, at: usize, new: &[String]) -> String {
 }
 
 pub fn status_line(lead: &str, pid: &str, msg: &str) -> String {
-    format!("{lead}^ {WORKING} {pid} · {msg}")
+    format!("{lead}{} {WORKING} {pid} · {msg}", marks().ask)
+}
+
+/// The words of a prompt as caret lines again.
+pub fn prompt_lines(lead: &str, words: &str) -> Vec<String> {
+    let ask = &marks().ask;
+    words.split('\n').map(|w| format!("{lead}{ask} {w}")).collect()
+}
+
+/// A reply line's text without its mark, or None for other lines.
+pub fn unreply(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    let r = t.strip_prefix(marks().reply.as_str())?;
+    Some(r.strip_prefix(' ').unwrap_or(r).to_string())
+}
+
+/// `^/name`, with the command mark in use.
+pub fn cmd(name: &str) -> String {
+    format!("{}{name}", marks().command)
 }
 
 /// Swap a status line for new lines (none removes it).
@@ -333,9 +439,9 @@ pub fn replace_status(rel: &str, text: &str, pid: &str, new: &[String]) -> Strin
 pub fn reply_lines(lead: &str, body: &str, limit: usize) -> Vec<String> {
     let rows: Vec<&str> = body.trim_end_matches('\n').split('\n').collect();
     let mut out: Vec<String> =
-        rows.iter().take(limit).map(|r| format!("{lead}^> {r}").trim_end().to_string()).collect();
+        rows.iter().take(limit).map(|r| format!("{lead}{} {r}", marks().reply).trim_end().to_string()).collect();
     if rows.len() > limit {
-        out.push(format!("{lead}^> … {} more lines, all in this folder's history in ~/.ambition/history", rows.len() - limit));
+        out.push(format!("{lead}{} … {} more lines, all in this folder's history in ~/.ambition/history", marks().reply, rows.len() - limit));
     }
     out
 }
@@ -437,6 +543,31 @@ mod tests {
         assert_eq!(kind("a.md", "  ^ indented never fires"), None);
         assert_eq!(kind("a.md", "# ^ a comment in a note is text"), None);
         assert_eq!(kind("a.md", "plain"), None);
+    }
+
+    #[test]
+    fn a_press_without_a_mark_is_a_request() {
+        assert_eq!(pressed("a.md", "just some text", 3), Ok(Pressed::Request));
+        assert_eq!(pressed("a.md", "", 3), Ok(Pressed::Request));
+        assert_eq!(pressed("a.md", "^ do it", 3), Ok(Pressed::Prompt));
+        assert_eq!(pressed("a.md", "^/undo", 3), Ok(Pressed::Command("undo".into())));
+        assert!(pressed("a.md", "^> a reply", 3).is_err());
+        assert!(pressed("a.md", "^ ◌ p1 · working", 3).is_err());
+    }
+
+    #[test]
+    fn other_marks() {
+        let m = Marks { ask: ">>".into(), reply: "<<".into(), command: "!!".into() };
+        set_marks(Some(m));
+        assert_eq!(kind("a.md", ">> tighten").unwrap().1, Kind::Prompt("tighten".into()));
+        assert_eq!(kind("a.md", "<< an answer").unwrap().1, Kind::Reply);
+        assert_eq!(kind("a.md", "!!undo").unwrap().1, Kind::Command { name: "undo".into(), args: "".into() });
+        assert_eq!(kind("a.md", "^ now plain text"), None);
+        assert_eq!(status_line("", "p2", "working"), ">> ◌ p2 · working");
+        assert_eq!(kind("a.md", ">> ◌ p2 · working").unwrap().1, Kind::Status("p2".into()));
+        assert_eq!(reply_lines("", "four", 3), vec!["<< four"]);
+        assert_eq!(kind("a.py", "  # !!help").unwrap().0, "  # ");
+        set_marks(None);
     }
 
     #[test]

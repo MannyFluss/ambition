@@ -97,17 +97,33 @@ pub enum Since {
 }
 
 /// The message for one press. `text` is the document as it is on disk, the
-/// status line on 0-based line `i`; `cli` is how the agent runs Ambition.
-pub fn press(path: &str, id: &str, words: &str, text: &str, i: usize, since: &Since, cli: &str) -> (String, (usize, usize)) {
+/// status line on 0-based line `i`; `cli` is how the agent runs Ambition;
+/// `words` is empty for a press on a line with no mark (a request), whose
+/// line is just above the status line. `note` says where the document is
+/// when it is a text field or an open buffer, and which copy to edit.
+#[allow(clippy::too_many_arguments)]
+pub fn press(path: &str, id: &str, words: &str, text: &str, i: usize, since: &Since, cli: &str, note: Option<&str>)
+    -> (String, (usize, usize)) {
     let all = lines(text);
     let (lo, hi) = window(all.len(), i, EACH_WAY);
-    let quoted: Vec<String> = words.split('\n').map(|l| format!("  {l}")).collect();
-    let mut parts = vec![
-        format!("[Ambition] A press in {path}, line {}: prompt {id}, now its status line there. Follow the rules in \
-                 this thread's first message: your answer goes in the document.", i + 1),
-        quoted.join("\n"),
-        format!("{path}, {}, as it is on disk now:\n{}", span_of(lo, hi, all.len()), numbered(&all, lo, hi).join("\n")),
-    ];
+    let reply = &C::marks().reply;
+    let mut parts = if words.is_empty() {
+        vec![format!("[Ambition] A press with no mark in {path}, on line {i}: a request. Its status line, {id}, is line {} \
+            now. Read around line {i} and do what the text there seems to need, following the rules in this thread's first \
+            message: the smallest change that does the job, in this document only, or one `{reply}` question when you \
+            are not sure what is wanted.", i + 1)]
+    } else {
+        let quoted: Vec<String> = words.split('\n').map(|l| format!("  {l}")).collect();
+        vec![
+            format!("[Ambition] A press in {path}, line {}: prompt {id}, now its status line there. Follow the rules in \
+                     this thread's first message: your answer goes in the document.", i + 1),
+            quoted.join("\n"),
+        ]
+    };
+    if let Some(n) = note {
+        parts.push(n.to_string());
+    }
+    parts.push(format!("{path}, {}, as it is on disk now:\n{}", span_of(lo, hi, all.len()), numbered(&all, lo, hi).join("\n")));
     match since {
         Since::First => {}
         Since::Nothing => parts.push("Nothing else in this document changed since your last turn.".into()),
@@ -164,7 +180,7 @@ mod tests {
         assert_eq!(window(40, 11, 8), (4, 20));
         assert_eq!(window(5, 0, 8), (1, 5));
         let text: String = (1..=30).map(|k| format!("line {k}\n")).collect();
-        let (msg, w) = press("~/a.md", "p1", "make it so", &text, 14, &Since::First, "ambition");
+        let (msg, w) = press("~/a.md", "p1", "make it so", &text, 14, &Since::First, "ambition", None);
         assert_eq!(w, (7, 23));
         assert!(msg.contains("lines 7-23 of 30") && msg.contains(" 7| line 7") && msg.contains("23| line 23") && !msg.contains("| line 24"));
         assert!(msg.contains("`ambition more up [n]` or `ambition more down [n]`"));
@@ -174,6 +190,15 @@ mod tests {
         let (_, w3) = more("~/a.md", &text, w2, false, 100);
         assert_eq!(w3, (3, 30));
         assert!(more("~/a.md", &text, w3, false, 5).0.contains("ends at line 30"));
+    }
+
+    #[test]
+    fn a_request_and_a_field() {
+        let text = "Dear Sam,\nthanks for the hlep yesterday\n^ ◌ p2 · working\n";
+        let (msg, _) = press("~/.ambition/fields/mail/x.txt", "p2", "", text, 2, &Since::First, "ambition", Some("This document is a text field in Mail."));
+        assert!(msg.starts_with("[Ambition] A press with no mark in ~/.ambition/fields/mail/x.txt, on line 2: a request."), "{msg}");
+        assert!(msg.contains("one `^>` question") && msg.contains("This document is a text field in Mail."), "{msg}");
+        assert!(msg.contains("2| thanks for the hlep yesterday"), "{msg}");
     }
 
     #[test]

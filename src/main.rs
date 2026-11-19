@@ -1,5 +1,5 @@
-//! `ambition`: write `^` at the start of a line in any file, press a key on
-//! it, and the answer lands in the file.
+//! `ambition`: press a key in any file or text field, and the agent's answer
+//! lands where you pressed.
 
 use ambition::app::{log, App};
 use ambition::{config, inbox, t3::T3, util};
@@ -12,22 +12,28 @@ const USAGE: &str = "\
 Ambition: a document you talk to.
 
   ambition                  run it. It sleeps until a key press reaches it.
-  ambition fire FILE:LINE   a press: send the ^ line at LINE of FILE. Your
-                            editor's key runs this (README: In your editor).
+                            On a Mac, its key (⌃⌥↩) presses in any text field.
+  ambition fire FILE:LINE   a press at LINE of FILE. Your editor's key runs
+                            this (README: In your editor).
   ambition allow FOLDER     let presses in FOLDER run without asking first.
-  ambition allow            the folders allowed so far.
+  ambition allow app:ID     the same for an app's text fields (a bundle id).
+  ambition allow            what is allowed so far.
   ambition lsp              the language server, for editors
 
 For the agent, while its turn runs:
 
   ambition more up|down [N]          N more lines of the document (40)
   ambition ask coordinator MESSAGE   ask the thread that knows the others
+  ambition read [field]              in a text field: its window's text, or
+                                     the whole field as it is now
+  ambition look                      in a text field: a screenshot of its window
 
-In a file:
+Where you press:
 
-  ^ make this shorter       a prompt: a press sends it to the agent
+  any line                  a request: the agent does what the text needs
+  ^ make this shorter       a prompt: says what to look at, and what to do
   ^/help                    a command: answered at once, with no model
-  ^> ...                    a reply: your next press in that file clears it
+  ^> ...                    a reply: your next press there clears it
 
 Everything Ambition keeps is in ~/.ambition (or $AMBITION_HOME).
 ";
@@ -44,6 +50,8 @@ fn main() {
         Some("allow") => allow(&rest()),
         Some("more") => more(&args[1..]),
         Some("ask") => ask(&args[1..]),
+        Some("read") => say(inbox::send(json!({"op": "read", "what": rest(), "cwd": cwd()}), Duration::from_secs(60))),
+        Some("look") => say(inbox::send(json!({"op": "look", "cwd": cwd()}), Duration::from_secs(60))),
         Some(a) if a.starts_with('-') => fail(2, &format!("ambition: no option {a}.\n\n{USAGE}")),
         Some(a) => fail(2, &format!(
             "ambition: Ambition 0.2 watches no folder, so `ambition {a}` does nothing. Run `ambition` alone, then press \
@@ -70,8 +78,18 @@ fn run() {
     let inbox = inbox::Inbox::open().unwrap_or_else(|e| fail(1, &format!("ambition: {e}")));
     log(&format!("Ambition {} is running, for {}. Press your editor's Ambition key on a ^ line in any file.",
         env!("CARGO_PKG_VERSION"), util::tilde(&home)));
+    let e = app.clone();
+    let _ = inbox::EDITORS.set(Box::new(move |conn, hello| e.editors.connect(conn, hello)));
     let a = app.clone();
-    inbox.serve(Arc::new(move |req| a.handle(req)));
+    let serve = move || inbox.serve(Arc::new(move |req| a.handle(req)));
+    // On a Mac with a screen, the main thread runs the app: the global key,
+    // the dialog and notices. The inbox is served beside it.
+    #[cfg(target_os = "macos")]
+    if ambition::mac::gui() {
+        std::thread::spawn(serve);
+        ambition::mac::run(app, lock);
+    }
+    serve();
     drop(lock);
 }
 
@@ -99,16 +117,23 @@ fn fire(arg: &str) {
 fn allow(arg: &str) {
     let arg = arg.trim();
     if arg.is_empty() {
-        let g = config::grants();
-        if g.is_empty() {
-            println!("No folder is allowed yet. The first press in a folder asks, or: ambition allow FOLDER");
+        let (g, a) = (config::grants(), config::app_grants());
+        if g.is_empty() && a.is_empty() {
+            println!("Nothing is allowed yet. The first press in a folder or app asks, or: ambition allow FOLDER");
         }
         for f in g {
             println!("{}", util::tilde(&f));
         }
+        for b in a {
+            println!("{}{b}", config::APP);
+        }
         return;
     }
-    match config::allow(&util::expand(arg)) {
+    let r = match arg.strip_prefix(config::APP) {
+        Some(b) => config::allow_app(b),
+        None => config::allow(&util::expand(arg)),
+    };
+    match r {
         Ok(t) => println!("{t}"),
         Err(e) => fail(1, &format!("ambition allow: {e}")),
     }

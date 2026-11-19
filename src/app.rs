@@ -17,7 +17,14 @@
 //!    ("Ambition: agent answered p3 …"), so `^/undo` takes it back.
 //!
 //! A press on a `^/command` runs it at once, in code (`commands.rs`); its
-//! output takes the command's place as `^>` lines.
+//! output takes the command's place as `^>` lines. A press on a line with no
+//! mark is a request: its status line goes just below that line, and the
+//! agent reads around it and does what the text seems to need.
+//!
+//! A text field (`field.rs`) is pressed the same way, through its mirror: the
+//! field's text goes into the mirror, the press runs there, and each change
+//! Ambition makes to the mirror (the status line, the answer) is written
+//! back into the field while the field still says what Ambition left in it.
 //!
 //! What Ambition keeps, all in `~/.ambition/`: `threads` (each document's
 //! thread), `state.json` (what is on its way now, for the language server),
@@ -29,9 +36,11 @@ use crate::commands as Cm;
 use crate::config;
 use crate::diff;
 use crate::engine::{Engine, Model, Selection, Status};
+use crate::field::{self, Snapshot, Surface};
 use crate::folder::{self, Folder};
 use crate::hook::{self, Since};
 use crate::inbox;
+use crate::ui::{self, Answer};
 use crate::util::{self, now};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -128,6 +137,21 @@ pub struct Turn {
     pub lead: String,
     /// The lines the agent has seen, 1-based: what `ambition more` adds to.
     pub seen: (usize, usize),
+    /// Where the document's text is: the file, or an open buffer's copy.
+    pub text_at: PathBuf,
+}
+
+/// A field that was pressed: how to reach it, what it said when Ambition last
+/// read or wrote it, what Ambition wrote last (for a second press), and an
+/// answer it could not take yet.
+struct Live {
+    surface: Arc<dyn Surface>,
+    snap: Snapshot,
+    shown: String,
+    span: Option<(usize, usize)>,
+    pending: Option<(String, String)>,
+    /// What the agent is told about where this document is.
+    note: String,
 }
 
 pub struct App {
@@ -145,6 +169,11 @@ pub struct App {
     /// One dialog at a time.
     dialog: Mutex<()>,
     projects: Mutex<BTreeMap<PathBuf, String>>,
+    /// The fields and open buffers pressed since Ambition started, by
+    /// document.
+    fields: Mutex<BTreeMap<PathBuf, Live>>,
+    /// The editors whose language servers are connected.
+    pub editors: crate::editor::Editors,
 }
 
 pub fn load(p: &Path) -> Value {
@@ -204,6 +233,8 @@ impl App {
             store: Mutex::new(()),
             dialog: Mutex::new(()),
             projects: Mutex::new(BTreeMap::new()),
+            fields: Mutex::new(BTreeMap::new()),
+            editors: Default::default(),
         }
     }
 
@@ -259,8 +290,9 @@ impl App {
                 continue;
             }
             let lead = t["lead"].as_str().unwrap_or("");
-            let mut new: Vec<String> = t["words"].as_str().unwrap_or("").split('\n').map(|w| format!("{lead}^ {w}")).collect();
-            new.push(format!("{lead}^> {id} was cut off when Ambition stopped. Press its line again to send it."));
+            let words = t["words"].as_str().unwrap_or("");
+            let mut new = if words.is_empty() { Vec::new() } else { C::prompt_lines(lead, words) };
+            new.extend(C::reply_lines(lead, &format!("{id} was cut off when Ambition stopped. Press its line again to send it."), 2));
             let _ = std::fs::write(&doc, C::replace_status(&rel, &text, id, &new));
             log(&format!("{id} in {} was cut off: its prompt is back", util::tilde(&doc)));
         }
@@ -280,6 +312,8 @@ impl App {
                 self.more(up, n, cwd.as_deref())
             }
             "ask" => self.ask(req["to"].as_str().unwrap_or(""), req["message"].as_str().unwrap_or(""), cwd.as_deref()),
+            "read" => self.agent_read(req["what"].as_str().unwrap_or(""), cwd.as_deref()),
+            "look" => self.agent_look(cwd.as_deref()),
             "ping" => Ok(format!("ambition {}", env!("CARGO_PKG_VERSION"))),
             other => Err(format!("Ambition has no request “{other}”")),
         };
@@ -352,7 +386,8 @@ impl App {
         Ok(p)
     }
 
-    /// Ask for a grant: a dialog on macOS, else `ambition allow`.
+    /// Ask for a folder's grant: a dialog, where there is a screen, else
+    /// `ambition allow`.
     fn grant(&self, doc: &Path, root: &Path) -> Result<(), String> {
         let how = format!("To let presses there run without asking: ambition allow {}", util::tilde(root));
         if config::too_wide(root) {
@@ -363,38 +398,39 @@ impl App {
         if config::place(doc).1 {
             return Ok(()); // the dialog before this one granted it
         }
-        if !cfg!(target_os = "macos") {
-            return Err(format!("{} is not allowed yet, so nothing was sent. {how}", util::tilde(root)));
-        }
-        let text = format!("A press in {} would send its ^ line to an agent with a shell, working in {}.\n\n\
+        let text = format!("A press in {} would send its line, and the lines around it, to an agent with a shell, working in {}.\n\n\
             Always lets every press in that folder run without asking.", util::tilde(doc), util::tilde(root));
-        let out = std::process::Command::new("osascript")
-            .args(["-e", "on run argv", "-e",
-                "display dialog (item 1 of argv) with title \"Ambition\" buttons {\"Deny\", \"Allow once\", \"Always\"} \
-                 default button \"Allow once\" cancel button \"Deny\" giving up after 120 with icon caution",
-                "-e", "end run", &text])
-            .output();
-        let out = match out {
-            Ok(o) => o,
-            Err(e) => return Err(format!("could not ask (osascript: {e}), so nothing was sent. {how}")),
-        };
-        let said = String::from_utf8_lossy(&out.stdout).to_string();
-        let err = String::from_utf8_lossy(&out.stderr).to_string();
-        if said.contains("gave up:true") {
-            return Err("nobody answered the dialog, so nothing was sent.".into());
-        }
-        if said.contains("button returned:Always") {
-            config::allow(root)?;
-            log(&format!("granted {}", util::tilde(root)));
+        let answer = ui::ask(&format!("Let Ambition work in {}?", util::tilde(root)), &text);
+        self.decide(answer, &util::tilde(root), &how, || config::allow(root))
+    }
+
+    /// Ask for an app's grant, for its text fields.
+    fn grant_app(&self, s: &Snapshot) -> Result<(), String> {
+        let _one = self.dialog.lock().unwrap();
+        if config::app_allowed(&s.bundle) {
             return Ok(());
         }
-        if said.contains("button returned:Allow once") {
-            return Ok(());
+        let how = format!("To let presses in {} run without asking: ambition allow {}{}", s.app, config::APP, s.bundle);
+        let text = format!("A press in {} would send the text around your cursor to an agent with a shell.\n\n\
+            Always lets every press in {}'s text fields run without asking, and lets the agent read and look at the window \
+            it was pressed in.", s.app, s.app);
+        let answer = ui::ask(&format!("Let Ambition work in {}?", s.app), &text);
+        self.decide(answer, &s.app, &how, || config::allow_app(&s.bundle))
+    }
+
+    /// What a grant dialog's answer means for the press.
+    fn decide(&self, answer: Answer, place: &str, how: &str, always: impl FnOnce() -> Result<String, String>) -> Result<(), String> {
+        match answer {
+            Answer::Always => {
+                always()?;
+                log(&format!("granted {place}"));
+                Ok(())
+            }
+            Answer::Once => Ok(()),
+            Answer::Deny => Err(format!("denied: nothing was sent from {place}.")),
+            Answer::Unanswered => Err("nobody answered the dialog, so nothing was sent.".into()),
+            Answer::Failed(e) => Err(format!("{place} is not allowed yet, and Ambition could not ask ({e}), so nothing was sent. {how}")),
         }
-        if err.contains("-128") || said.contains("button returned:Deny") {
-            return Err(format!("denied: nothing was sent from {}.", util::tilde(root)));
-        }
-        Err(format!("could not ask ({}), so nothing was sent. {how}", err.trim()))
     }
 
     // ---------- a press ----------
@@ -409,39 +445,109 @@ impl App {
         if meta.len() > folder::MAX_BYTES || !folder::is_text(&doc) {
             return Err(format!("{} is not a text file of up to 512 KB, so Ambition does not read it.", util::tilde(&doc)));
         }
-        let text = std::fs::read_to_string(&doc).map_err(|e| e.to_string())?;
+        // An editor's open buffer, unsaved, is the document; else the file.
+        let buffer = self.editors.buffer(&doc);
+        let text = match &buffer {
+            Some(b) => b.read()?,
+            None => std::fs::read_to_string(&doc).map_err(|e| e.to_string())?,
+        };
+        if let Some(b) = &buffer {
+            let surface: Arc<dyn Surface> = Arc::new(crate::editor::Buffer::clone_of(b));
+            if let Some(r) = self.again(&doc, &text, surface) {
+                return r;
+            }
+        }
         let name = doc.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let lines: Vec<&str> = text.split('\n').collect();
         let n = hook::lines(&text).len();
         if line == 0 || line > n.max(1) {
             return Err(format!("{name} has {n} lines, so there is no line {line} to send."));
         }
-        let command = match C::kind(&name, lines[line - 1]) {
-            Some((_, C::Kind::Prompt(_))) => None,
-            Some((_, C::Kind::Command { name: c, .. })) => Some(c),
-            Some((_, C::Kind::Status(id))) => return Err(format!("{id} is on its way already. Its status line goes when its turn ends.")),
-            Some((_, C::Kind::Reply)) => return Err(format!("line {line} is a reply (^>), not a prompt. The next press in {name} clears it.")),
-            Some((_, C::Kind::Other)) => return Err(format!("line {line} has a ^ with nothing after it to send.")),
-            None => return Err(format!("line {line} of {name} does not start with ^, so there is nothing to send. Press on a ^ line.")),
-        };
+        C::reload();
+        let what = C::pressed(&name, lines[line - 1], line)?;
         let (root, allowed) = config::place(&doc);
         if !allowed {
             self.grant(&doc, &root)?;
         }
         let place = self.place(&root)?;
-        let rel = place.f.rel(&doc).unwrap_or(name);
-        match command {
-            None => self.prompt_press(&place, &doc, &rel, line - 1),
-            Some(c) => self.command_press(&place, &doc, &rel, line - 1, &c),
+        let rel = place.f.rel(&doc).unwrap_or(name.clone());
+        self.busy_here(&place, &doc)?;
+        match buffer {
+            Some(b) => {
+                let copy = util::state_dir().join("buffers").join(&util::sha(&key(&doc))[..12]).join(&name);
+                if let Some(d) = copy.parent() {
+                    let _ = std::fs::create_dir_all(d);
+                }
+                std::fs::write(&copy, &text).map_err(|e| format!("cannot write {}: {e}", util::tilde(&copy)))?;
+                place.f.mirror(&rel, Some(copy.clone()));
+                let client = b.client().to_string();
+                let note = format!("{} is open in {client}, with changes not saved to disk. Do not edit that file on disk: edit \
+                    its copy, {}, and Ambition puts your changes in the open buffer when your turn ends, unsaved.",
+                    util::tilde(&doc), util::tilde(&copy));
+                let snap = Snapshot { app: client, title: rel.clone(), text: text.clone(), line: line - 1, ..Default::default() };
+                self.fields.lock().unwrap().insert(doc.clone(), Live { surface: Arc::new(b), snap, shown: text, span: None, pending: None, note });
+            }
+            None => {
+                place.f.mirror(&rel, None);
+                self.fields.lock().unwrap().remove(&doc);
+            }
+        }
+        self.dispatch(&place, &doc, &rel, line - 1, what)
+    }
+
+    /// A press in a document whose turn is running now would overwrite the
+    /// agent's work in its copy.
+    fn busy_here(&self, place: &Place, doc: &Path) -> Result<(), String> {
+        let q = place.q.lock().unwrap();
+        match (&q.busy, &q.doc) {
+            (Some(b), Some(d)) if d == doc && self.fields.lock().unwrap().contains_key(doc) => {
+                Err(format!("{b} is still working in this document. Press again when it is done."))
+            }
+            _ => Ok(()),
         }
     }
 
-    fn prompt_press(self: &Arc<Self>, place: &Arc<Place>, doc: &Path, rel: &str, i: usize) -> Result<String, String> {
+    /// A press on a field or buffer that says what Ambition left in it, with
+    /// an answer that could not land, or a change to show again.
+    fn again(&self, doc: &Path, text: &str, surface: Arc<dyn Surface>) -> Option<Result<String, String>> {
+        let found = {
+            let mut f = self.fields.lock().unwrap();
+            match f.get_mut(doc) {
+                Some(l) if l.shown == text && (l.pending.is_some() || l.span.is_some()) => {
+                    l.surface = surface.clone();
+                    Some((l.pending.clone(), l.span))
+                }
+                _ => None,
+            }
+        };
+        match found? {
+            (Some((what, t)), _) => Some(self.push(doc, &t, true, Some(&what)).map(|_| format!("{what} is in now."))),
+            (None, Some(span)) => Some(surface.highlight(text, span).map(|_| "showed what Ambition wrote last.".to_string())),
+            _ => None,
+        }
+    }
+
+    fn dispatch(self: &Arc<Self>, place: &Arc<Place>, doc: &Path, rel: &str, i: usize, what: C::Pressed) -> Result<String, String> {
+        match what {
+            C::Pressed::Prompt => self.prompt_press(place, doc, rel, i, false),
+            C::Pressed::Request => self.prompt_press(place, doc, rel, i, true),
+            C::Pressed::Command(c) => self.command_press(place, doc, rel, i, &c),
+        }
+    }
+
+    /// A press on a prompt, or, with `request`, on a line with no mark.
+    fn prompt_press(self: &Arc<Self>, place: &Arc<Place>, doc: &Path, rel: &str, i: usize, request: bool) -> Result<String, String> {
         let mut q = place.q.lock().unwrap();
         let io = self.io.lock().unwrap();
         let text = place.f.read(rel).unwrap_or_default();
-        let Some(p) = C::prompts(rel, &text).into_iter().find(|p| p.start <= i && i < p.end) else {
-            return Err("the prompt changed while it was pressed; press it again.".into());
+        let p = if request {
+            // No prompt leaves the text: the status line goes just below the line pressed.
+            C::Prompt { start: i + 1, end: i + 1, lead: String::new(), text: String::new() }
+        } else {
+            match C::prompts(rel, &text).into_iter().find(|p| p.start <= i && i < p.end) {
+                Some(p) => p,
+                None => return Err("the prompt changed while it was pressed; press it again.".into()),
+            }
         };
         let id = self.next_id();
         let ahead = q.busy.clone();
@@ -451,18 +557,29 @@ impl App {
         };
         let (cleared, gone) = C::clear_replies(rel, &text, true);
         let start = diff::remap(&text, &cleared, p.start);
-        let (stripped, pos) = C::remove(&cleared, &[(start, start + (p.end - p.start))]);
-        let status = C::status_line(&p.lead, &id, &format!("{} · {state}", util::cut(&p.text, 48)));
-        place.f.write(rel, &C::insert(&stripped, pos[0], &[status]));
+        let (stripped, at) = if request {
+            (cleared.clone(), start)
+        } else {
+            let (s, pos) = C::remove(&cleared, &[(start, start + (p.end - p.start))]);
+            (s, pos[0])
+        };
+        let status = C::status_line(&p.lead, &id, &status_words(&p.text, &state));
+        let shown = C::insert(&stripped, at, &[status]);
+        place.f.write(rel, &shown);
+        // In a field, the status line must reach the field before anything is sent.
+        if let Err(e) = self.push(doc, &shown, false, None) {
+            place.f.write(rel, &text);
+            return Err(format!("nothing was sent: Ambition could not write in the field ({e})."));
+        }
         drop(io);
         if !gone.is_empty() {
             place.f.history(&format!("## {} · {rel} · cleared\n{}", now(), gone.join("\n")));
         }
-        let words: Vec<String> = p.text.split('\n').map(|l| format!("^ {l}")).collect();
-        place.f.history(&format!("## {} · {rel} · {id} · asked\n{}", now(), words.join("\n")));
+        let asked = if request { format!("(a press with no mark, on line {})", i + 1) } else { C::prompt_lines("", &p.text).join("\n") };
+        place.f.history(&format!("## {} · {rel} · {id} · asked\n{asked}", now()));
         self.turns.lock().unwrap().push(Turn {
             id: id.clone(), doc: doc.to_path_buf(), folder: place.f.root.clone(), working: ahead.is_none(), since: util::epoch(),
-            thread: String::new(), words: p.text.clone(), lead: p.lead.clone(), seen: (0, 0),
+            thread: String::new(), words: p.text.clone(), lead: p.lead.clone(), seen: (0, 0), text_at: place.f.file(rel),
         });
         q.jobs.push_back(Job::Press(Ask { id: id.clone(), doc: doc.to_path_buf(), rel: rel.to_string(), p }));
         let go = q.busy.is_none();
@@ -501,7 +618,8 @@ impl App {
                 let (stripped, pos) = C::remove(&cleared, &[(at, at + 1)]);
                 place.f.write(rel, &stripped);
                 if held {
-                    place.f.commit(&format!("Ambition: pressed ^/{name} in {rel}"));
+                    place.f.track(rel);
+                    place.f.commit(&format!("Ambition: pressed {} in {rel}", C::cmd(name)));
                 }
                 (c, stripped, pos[0])
             })
@@ -513,17 +631,23 @@ impl App {
             return Err("the command changed while it was pressed; press it again.".into());
         };
         let reply = self.run_command(&c, place, doc, rel, &unit_above(rel, &stripped, at), held);
-        {
+        let done = {
             let _io = self.io.lock().unwrap();
             let text = place.f.read(rel).unwrap_or_default();
             let here = diff::remap(&stripped, &text, at);
-            place.f.write(rel, &C::insert(&text, here, &C::reply_lines(&c.lead, &reply, 12)));
-        }
-        let line = format!("^/{} {}", c.name, c.args);
+            let done = C::insert(&text, here, &C::reply_lines(&c.lead, &reply, 12));
+            place.f.write(rel, &done);
+            done
+        };
+        let line = format!("{} {}", C::cmd(&c.name), c.args);
         place.f.history(&format!("## {} · {rel} · ^/{} · command\n{}\n{}", now(), c.name, line.trim_end(),
             C::reply_lines("", &reply, usize::MAX).join("\n")));
         if held {
             place.f.commit(&format!("Ambition: command /{} in {rel}", c.name));
+        }
+        self.push_or_tell(doc, &done, &format!("{}'s answer", C::cmd(&c.name)));
+        if held {
+            place.f.keep_whole();
             self.release(place);
         }
         Ok(reply)
@@ -588,6 +712,8 @@ impl App {
             }
             self.turns.lock().unwrap().retain(|t| t.id != id);
             self.publish();
+            // After the first turn's answer, never before it.
+            place.f.keep_whole();
         }
     }
 
@@ -595,11 +721,12 @@ impl App {
 
     fn turn(&self, place: &Place, a: Ask) {
         let f = &place.f;
-        let working = C::status_line(&a.p.lead, &a.id, &format!("{} · working", util::cut(&a.p.text, 48)));
+        let working = C::status_line(&a.p.lead, &a.id, &status_words(&a.p.text, "working"));
         // The folder as it is, without this status line, is one commit: the
         // writer's own typing, which ^/undo of the turn leaves alone.
         let started = {
             let _io = self.io.lock().unwrap();
+            self.catch_up(&a.doc, &a.rel, &a.id, f);
             let text = f.read(&a.rel).unwrap_or_default();
             match C::statuses(&a.rel, &text).get(&a.id).copied() {
                 None => None,
@@ -608,6 +735,7 @@ impl App {
                     lines.remove(i);
                     let t0 = lines.join("\n");
                     f.write(&a.rel, &t0);
+                    f.track(&a.rel);
                     f.commit(&format!("Ambition: pressed {} in {}", a.id, a.rel));
                     let t1 = C::insert(&t0, i, &[working]);
                     f.write(&a.rel, &t1);
@@ -619,6 +747,8 @@ impl App {
             f.history(&format!("## {} · {} · {} · dropped\nIts status line was gone when its turn came, so nothing was sent.", now(), a.rel, a.id));
             return;
         };
+        // A press that waited said so in its field; now it says working.
+        let _ = self.push(&a.doc, &start, false, None);
         self.set_turn(&a.id, |t| {
             t.working = true;
             t.since = util::epoch();
@@ -633,7 +763,8 @@ impl App {
                 hook::changes(&a.rel, &old, &new).map(Since::Diff).unwrap_or(Since::Nothing)
             }
         };
-        let (msg, seen) = hook::press(&util::tilde(&a.doc), &a.id, &a.p.text, &start, i, &since, &self.cli);
+        let note = self.fields.lock().unwrap().get(&a.doc).map(|l| l.note.clone());
+        let (msg, seen) = hook::press(&util::tilde(&a.doc), &a.id, &a.p.text, &start, i, &since, &self.cli, note.as_deref());
         self.set_turn(&a.id, |t| t.seen = seen);
 
         let (mut tid, mut link, mut run, mut status, mut err) = (String::new(), String::new(), String::new(), Status::Failed, String::new());
@@ -677,10 +808,7 @@ impl App {
             // agent end its turn by repeating its ^> lines; when those never
             // reached the file, they go where the prompt stood. With no ^> lines,
             // the last message counts only when the turn changed no file at all.
-            let unmark = |l: &str| {
-                let t = l.trim_start();
-                t.strip_prefix("^>").map(|r| r.strip_prefix(' ').unwrap_or(r).to_string())
-            };
+            let unmark = |l: &str| C::unreply(l);
             let marked: Vec<String> = said.split('\n').filter_map(unmark).collect();
             let body = if !marked.is_empty() {
                 marked.join("\n")
@@ -699,7 +827,9 @@ impl App {
             if link.is_empty() { String::new() } else { format!("\nThread: {link}") },
             if reps.is_empty() { String::new() } else { format!("\nReplies in the file now:\n{}", reps.join("\n")) }));
         f.commit(&format!("Ambition: agent answered {} in {}: {}", a.id, a.rel, util::cut(&a.p.text, 70)));
+        let done = f.read(&a.rel).unwrap_or_default();
         drop(_io);
+        self.push_or_tell(&a.doc, &done, &format!("{}'s answer", a.id));
         let head = f.head();
         self.update_entry(&a.doc, |v| {
             v["last"] = json!(head);
@@ -713,6 +843,7 @@ impl App {
         let f = &place.f;
         {
             let _io = self.io.lock().unwrap();
+            f.track(&m.rel);
             f.commit(&format!("Ambition: saved before a message to {}", m.rel));
         }
         let start = m.doc == coordinator_doc();
@@ -869,14 +1000,29 @@ impl App {
         let (tid, link, run) = match why {
             Some(w) if start => {
                 let project = self.project_id(root)?;
+                // The thread before this one's model; else the model chosen last;
+                // else the model of the last thread Ambition started; else the
+                // project's. Never a model picked from a list by chance: with
+                // none of these, T3 Code starts the thread on its own default.
                 let sel = (!old.is_empty() && w != "gone").then(|| self.engine.model_of(&old).ok().flatten()).flatten()
                     .or_else(|| self.last_model())
-                    .or_else(|| self.engine.project_model(&project).ok().flatten())
-                    .or_else(|| self.first_model(&project));
+                    .or_else(|| self.last_started())
+                    .or_else(|| self.engine.project_model(&project).ok().flatten());
                 let first = format!("{}\n\n{text}", self.handoff(&place.f, doc, rel, w, if turn.is_some() { "press" } else { "message" }));
-                let title = if doc == coordinator_doc() { "Ambition · coordinator".to_string() } else { format!("Ambition · {rel}") };
+                let name = d["field"]["app"].as_str().map(|app| format!("{app}: {}", d["field"]["title"].as_str().unwrap_or(rel)));
+                let title = if doc == coordinator_doc() {
+                    "Ambition · coordinator".to_string()
+                } else {
+                    format!("Ambition · {}", util::cut(name.as_deref().unwrap_or(rel), 70))
+                };
                 let (tid, run) = self.engine.launch(&project, &title, &first, sel.as_ref())?;
                 let link = self.engine.thread(&tid).ok().flatten().map(|t| t.link).unwrap_or_default();
+                if let Some(s) = &sel {
+                    let _g = self.store.lock().unwrap();
+                    let mut d = load(&Self::models_file());
+                    d["started"] = sel_json(s);
+                    save(&Self::models_file(), &d);
+                }
                 if !old.is_empty() && w != "gone" {
                     let _ = self.engine.settle(&old);
                 }
@@ -912,6 +1058,144 @@ impl App {
         Ok((tid, link, run, status))
     }
 
+    // ---------- fields ----------
+
+    /// A press in a text field. `snap` is what the field said; `surface`
+    /// reaches it again.
+    pub fn field_press(self: &Arc<Self>, snap: Snapshot, surface: Arc<dyn Surface>) -> Result<String, String> {
+        C::reload();
+        let (dir, name) = field::mirror(&snap);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("cannot make {}: {e}", util::tilde(&dir)))?;
+        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+        let doc = dir.join(&name);
+        if let Some(r) = self.again(&doc, &snap.text, surface.clone()) {
+            if let Some(l) = self.fields.lock().unwrap().get_mut(&doc) {
+                l.snap = snap.clone();
+            }
+            return r;
+        }
+        if field::blank(&snap.text) {
+            let mut m = format!("the field in {} looks empty to Ambition, so there is nothing to send.", snap.app);
+            if snap.url.as_deref().is_some_and(|u| u.contains("docs.google.com")) {
+                m.push_str(" Google Docs shows its text only with its screen reader and braille support on: in the document, \
+                    press ⌘⌥Z, then ⌘⌥H (Tools › Accessibility settings).");
+            }
+            return Err(m);
+        }
+        let lines: Vec<&str> = snap.text.split('\n').collect();
+        let i = snap.line.min(lines.len().saturating_sub(1));
+        let what = C::pressed(&name, lines[i], i + 1)?;
+        if !config::app_allowed(&snap.bundle) {
+            self.grant_app(&snap)?;
+        }
+        let place = self.place(&dir)?;
+        self.busy_here(&place, &doc)?;
+        {
+            let _io = self.io.lock().unwrap();
+            place.f.write(&name, &snap.text);
+        }
+        let entry = json!({"app": snap.app, "bundle": snap.bundle, "title": snap.title, "url": snap.url, "where": field::describe(&snap)});
+        let note = format!("This document is {}. Ambition mirrors that field in {}: edit the file, and Ambition puts your \
+            changes in the field when your turn ends. For the rest of the window: `{cli} read` (its text) or `{cli} look` \
+            (a screenshot).", field::describe(&snap), util::tilde(&doc), cli = self.cli);
+        self.fields.lock().unwrap().insert(doc.clone(), Live { surface, shown: snap.text.clone(), snap, span: None, pending: None, note });
+        self.update_entry(&doc, |v| v["field"] = entry);
+        self.dispatch(&place, &doc, &name, i, what)
+    }
+
+    /// Write a mirror's new text into its field, when the document is one
+    /// (else nothing happens). `mark` highlights what changed. When `keep`
+    /// names it and the write cannot happen, the text waits for the next
+    /// press in that field.
+    fn push(&self, doc: &Path, new: &str, mark: bool, keep: Option<&str>) -> Result<(), String> {
+        let (surface, shown) = match self.fields.lock().unwrap().get(doc) {
+            Some(l) => (l.surface.clone(), l.shown.clone()),
+            None => return Ok(()),
+        };
+        if shown == new {
+            return Ok(());
+        }
+        let r = surface.write(&shown, new, mark);
+        let mut f = self.fields.lock().unwrap();
+        let Some(l) = f.get_mut(doc) else { return r.map(|_| ()) };
+        match r {
+            Ok(now) => {
+                l.span = mark.then(|| field::changed(&shown, &now));
+                l.shown = now;
+                l.pending = None;
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(what) = keep {
+                    l.pending = Some((what.to_string(), new.to_string()));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Write an answer into its field, or say why it is not there.
+    fn push_or_tell(&self, doc: &Path, new: &str, what: &str) {
+        if let Err(e) = self.push(doc, new, true, Some(what)) {
+            let place = self.fields.lock().unwrap().get(doc).map(|l| l.snap.app.clone()).unwrap_or_default();
+            ui::tell(&format!("{what} is ready, but not in {place}: {e} A press in that field puts it in, if the field is as \
+                Ambition left it. It is also in {}.", util::tilde(doc)));
+        }
+    }
+
+    /// Before a field's turn starts: when the field changed while the press
+    /// waited, and still holds its status line, the mirror takes the field.
+    fn catch_up(&self, doc: &Path, rel: &str, id: &str, f: &Folder) {
+        let Some((surface, shown)) = self.fields.lock().unwrap().get(doc).map(|l| (l.surface.clone(), l.shown.clone())) else { return };
+        let Ok(now) = surface.read() else { return };
+        if now != shown && C::statuses(rel, &now).contains_key(id) {
+            f.write(rel, &now);
+            if let Some(l) = self.fields.lock().unwrap().get_mut(doc) {
+                l.shown = now;
+            }
+        }
+    }
+
+    /// The field whose turn an agent's command came from. Only a granted
+    /// press starts a turn, so a running turn is the grant for `read` and
+    /// `look`: Always for that app, or Allow once for this press.
+    fn turn_field(&self, cwd: Option<&Path>) -> Result<(Arc<dyn Surface>, Snapshot), String> {
+        let Some((doc, _)) = self.asker(cwd) else {
+            return Err("no press is with an agent here now, so there is no window to read.".into());
+        };
+        match self.fields.lock().unwrap().get(&doc) {
+            Some(l) => Ok((l.surface.clone(), l.snap.clone())),
+            None => Err(format!("this turn's document, {}, is a file, not a text field: `ambition read` and `ambition look` \
+                work in a field's turn.", util::tilde(&doc))),
+        }
+    }
+
+    /// `ambition read`: the visible text of the field's window, or with
+    /// `field`, the whole field as it is now.
+    pub fn agent_read(&self, what: &str, cwd: Option<&Path>) -> Result<String, String> {
+        let (s, snap) = self.turn_field(cwd)?;
+        if what == "field" {
+            return s.read();
+        }
+        let t = s.window_text()?;
+        Ok(format!("The visible text of {}'s window “{}”, from Accessibility:\n\n{t}", snap.app, snap.title))
+    }
+
+    /// `ambition look`: a screenshot of the field's window.
+    pub fn agent_look(&self, cwd: Option<&Path>) -> Result<String, String> {
+        let (s, snap) = self.turn_field(cwd)?;
+        let dir = util::state_dir().join("looks");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let mut old: Vec<PathBuf> = std::fs::read_dir(&dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
+        old.sort();
+        for p in old.iter().take(old.len().saturating_sub(19)) {
+            let _ = std::fs::remove_file(p);
+        }
+        let out = dir.join(format!("{}.png", chrono::Local::now().format("%Y%m%d-%H%M%S-%3f")));
+        s.look(&out)?;
+        Ok(format!("A screenshot of {}'s window “{}” is at {}. Open the image to see it.", snap.app, snap.title, out.display()))
+    }
+
     // ---------- what agents ask for ----------
 
     /// The busy folder an agent's command came from, by its working folder:
@@ -945,7 +1229,7 @@ impl App {
             _ => return Err("several presses are with agents now: run it from your document's folder.".into()),
         };
         let t = &mut turns[k];
-        let text = std::fs::read_to_string(&t.doc).map_err(|e| format!("cannot read {}: {e}", util::tilde(&t.doc)))?;
+        let text = std::fs::read_to_string(&t.text_at).map_err(|e| format!("cannot read {}: {e}", util::tilde(&t.doc)))?;
         let (out, seen) = hook::more(&util::tilde(&t.doc), &text, t.seen, up, n);
         t.seen = seen;
         Ok(out)
@@ -1008,13 +1292,17 @@ impl App {
         own("models.json")
     }
 
-    /// For a project with no model yet: the first one the engine lists.
-    fn first_model(&self, project: &str) -> Option<Selection> {
-        let m = self.refresh_models().ok()?.into_iter().next()?;
-        let sel = Selection { instance: m.instance, model: m.id, effort: None };
-        let _ = self.engine.use_model(None, project, &sel);
-        log(&format!("{} had no model to start with: using {}, its first. ^/model changes it.", self.engine.name(), m.label));
-        Some(sel)
+    /// The model of the last thread Ambition started: as kept in
+    /// `models.json`, else asked of the newest thread in `threads`.
+    fn last_started(&self) -> Option<Selection> {
+        if let Some(s) = sel_from(&load(&Self::models_file())["started"]) {
+            return Some(s);
+        }
+        let all = load(&own("threads"));
+        let mut rows: Vec<(&str, &str)> = all.as_object()?.values()
+            .filter_map(|v| Some((v["started"].as_str()?, v["thread"].as_str()?))).collect();
+        rows.sort();
+        rows.iter().rev().find_map(|(_, tid)| self.engine.model_of(tid).ok().flatten())
     }
 
     fn refresh_models(&self) -> Result<Vec<Model>, String> {
@@ -1297,9 +1585,18 @@ impl App {
     }
 }
 
+/// A status line's words: the prompt's, cut, then its state.
+fn status_words(text: &str, state: &str) -> String {
+    if text.is_empty() {
+        state.to_string()
+    } else {
+        format!("{} · {state}", util::cut(text, 48))
+    }
+}
+
 /// Whether a file other than `rel` differs from the last commit.
 fn others_changed(f: &Folder, rel: &str) -> bool {
-    let out = f.git(&["status", "--porcelain", "-z", "--untracked-files=all"]);
+    let out = f.git(&["status", "--porcelain", "-z", if f.whole() { "--untracked-files=all" } else { "--untracked-files=no" }]);
     out.stdout.split(|&b| b == 0).filter_map(|s| std::str::from_utf8(s).ok()).filter(|s| s.len() > 3).any(|s| &s[3..] != rel)
 }
 

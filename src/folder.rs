@@ -7,7 +7,12 @@
 //! ```
 //!
 //! `^/undo` works from the private history, so your own repo is never
-//! touched. It stays outside the folder: inside, editors took it for a
+//! touched.
+//!
+//! The first press in a folder keeps only its own document, so nothing waits
+//! on a copy of a big folder; the whole folder is kept right after that
+//! first turn ends, and every turn after it is one commit of the folder. So
+//! the first turn's `^/undo` covers its document only. It stays outside the folder: inside, editors took it for a
 //! repository of yours (Zed hung on it). Ambition writes nothing in the
 //! folder but the answers.
 
@@ -29,7 +34,7 @@ pub struct Out {
 pub const MAX_BYTES: u64 = 512 * 1024;
 
 /// Ambition's own files in its own folder, kept out of that folder's history.
-const OWN: &str = "/history/\n/state.json\n/threads\n/models.json\n/inbox\n/config\n/lock\n/*.tmp*\n";
+const OWN: &str = "/history/\n/fields/\n/looks/\n/state.json\n/threads\n/models.json\n/inbox\n/config\n/lock\n/*.tmp*\n";
 
 pub struct Folder {
     pub root: PathBuf,
@@ -37,6 +42,9 @@ pub struct Folder {
     pub git_dir: PathBuf,
     /// The record of every prompt, command and reply here.
     pub log: PathBuf,
+    /// Files open in an editor, by path in the folder: where their text is
+    /// kept instead (`editor.rs`). Reading, writing and the history use it.
+    mirrors: std::sync::Mutex<BTreeMap<String, PathBuf>>,
 }
 
 /// Commit subjects of the changes ^/undo may take back.
@@ -48,7 +56,7 @@ impl Folder {
         let name = name.trim_start_matches('.').to_string();
         let hash = crate::util::sha(&root.to_string_lossy());
         let base = crate::util::state_dir().join("history").join(format!("{name}-{}", &hash[..8]));
-        Folder { root: root.to_path_buf(), git_dir: base.with_extension("git"), log: base.with_extension("md") }
+        Folder { root: root.to_path_buf(), git_dir: base.with_extension("git"), log: base.with_extension("md"), mirrors: Default::default() }
     }
 
     /// A path relative to the folder, with `/`.
@@ -76,10 +84,6 @@ impl Folder {
             if !out.status.success() {
                 return Err(format!("git init failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
             }
-            let own = crate::util::state_real();
-            let exclude = if self.root == own { OWN } else { "" };
-            let _ = fs::create_dir_all(git.join("info"));
-            let _ = fs::write(git.join("info").join("exclude"), format!("/.ambition/\n{exclude}"));
             for (k, v) in [
                 ("user.name", "Ambition"),
                 ("user.email", "ambition@localhost"),
@@ -94,10 +98,39 @@ impl Folder {
             let _ = fs::create_dir_all(&nohooks);
             self.git(&["config", "core.hooksPath", &nohooks.to_string_lossy()]);
         }
-        if self.git(&["rev-parse", "--verify", "-q", "HEAD"]).stdout.is_empty() {
-            self.commit("Ambition: the first press in this folder");
+        // Written each time, so a newer Ambition's list reaches an older history.
+        let own = crate::util::state_real();
+        let exclude = if self.root == own { OWN } else { "" };
+        let _ = fs::create_dir_all(git.join("info"));
+        let _ = fs::write(git.join("info").join("exclude"), format!("/.ambition/\n{exclude}"));
+        // A history from before this rule kept the whole folder already.
+        if !self.whole() && !self.git(&["rev-parse", "--verify", "-q", "HEAD"]).stdout.is_empty() {
+            let _ = fs::write(self.git_dir.join("ambition-whole"), "");
         }
         Ok(())
+    }
+
+    /// Whether the history keeps the whole folder yet, or only the documents
+    /// pressed so far.
+    pub fn whole(&self) -> bool {
+        self.git_dir.join("ambition-whole").exists()
+    }
+
+    /// Keep this document in the history from now on.
+    pub fn track(&self, rel: &str) {
+        if !self.whole() && self.path(rel).is_file() && !self.mirrors.lock().unwrap().contains_key(rel) {
+            self.git(&["add", "--force", "--", rel]);
+        }
+    }
+
+    /// Keep the whole folder from now on: one commit of everything in it.
+    /// Run after the first turn, never before a dialog, a status or an answer.
+    pub fn keep_whole(&self) {
+        if self.whole() {
+            return;
+        }
+        let _ = fs::write(self.git_dir.join("ambition-whole"), "");
+        self.commit("Ambition: kept the whole folder from here on");
     }
 
     /// git, with the private history as its repo and the folder as its work tree.
@@ -160,8 +193,24 @@ impl Folder {
         is_text(&p)
     }
 
+    /// Where a file's text is: its mirror while an editor has it open, else
+    /// the file.
+    pub fn file(&self, rel: &str) -> PathBuf {
+        self.mirrors.lock().unwrap().get(rel).cloned().unwrap_or_else(|| self.path(rel))
+    }
+
+    /// Keep this file's text in `mirror` (an open buffer's), or, with None,
+    /// in the file again.
+    pub fn mirror(&self, rel: &str, mirror: Option<PathBuf>) {
+        let mut m = self.mirrors.lock().unwrap();
+        match mirror {
+            Some(p) => m.insert(rel.to_string(), p),
+            None => m.remove(rel),
+        };
+    }
+
     pub fn read(&self, rel: &str) -> Option<String> {
-        let bytes = fs::read(self.path(rel)).ok()?;
+        let bytes = fs::read(self.file(rel)).ok()?;
         String::from_utf8(bytes).ok()
     }
 
@@ -170,7 +219,7 @@ impl Folder {
         if self.read(rel).as_deref() == Some(text) {
             return false;
         }
-        let p = self.path(rel);
+        let p = self.file(rel);
         if let Some(d) = p.parent() {
             let _ = fs::create_dir_all(d);
         }
@@ -198,10 +247,19 @@ impl Folder {
         self.git(&["add", "--update", "--", "."]);
         let tracked: std::collections::BTreeSet<String> =
             self.git_text(&["ls-files", "-z"]).split('\0').map(str::to_string).collect();
-        let new: Vec<String> = self.files().into_iter().filter(|f| !tracked.contains(f)).collect();
+        // Until the whole folder is kept, only the documents tracked so far.
+        let new: Vec<String> = if self.whole() { self.files().into_iter().filter(|f| !tracked.contains(f)).collect() } else { Vec::new() };
         if !new.is_empty() {
             let list = new.join("\0");
             self.git_in(&["add", "--force", "--pathspec-from-file=-", "--pathspec-file-nul"], Some(list.as_bytes()));
+        }
+        // An open buffer's text is what the history keeps, not the file's.
+        let mirrored: Vec<(String, PathBuf)> = self.mirrors.lock().unwrap().iter().map(|(r, p)| (r.clone(), p.clone())).collect();
+        for (rel, p) in mirrored {
+            let sha = String::from_utf8_lossy(&self.git(&["hash-object", "-w", "--", &p.to_string_lossy()]).stdout).trim().to_string();
+            if !sha.is_empty() {
+                self.git(&["update-index", "--add", "--cacheinfo", &format!("100644,{sha},{rel}")]);
+            }
         }
         if self.git(&["diff", "--cached", "--quiet"]).ok
             && !self.git_text(&["rev-parse", "--verify", "-q", "HEAD"]).is_empty()
