@@ -1,12 +1,15 @@
 // Ambition's press, as a Zed task. Copy this entry into ~/.config/zed/tasks.json
-// (Zed: "zed: open tasks"). It saves the file, then sends the ^ line under the
-// cursor. Its terminal stays hidden unless the press fails, so you see why.
+// (Zed: "zed: open tasks") and put the full path of your ambition in "command"
+// (`which ambition` prints it). It saves nothing: with the Ambition extension,
+// Ambition reads the open buffer as it is and edits it in place. It runs
+// through /bin/sh, not your login shell, which can take most of a second.
+// Its terminal stays hidden unless the press fails, so you see why.
 [
   {
     "label": "Ambition: press",
-    "command": "ambition",
+    "command": "/full/path/to/ambition",
     "args": ["fire", "$ZED_FILE:$ZED_ROW"],
-    "save": "current",
+    "shell": { "program": "/bin/sh" },
     "reveal": "never",
     "hide": "on_success",
     "allow_concurrent_runs": true,

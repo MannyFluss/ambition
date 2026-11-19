@@ -1,8 +1,8 @@
-# Ambition, in ten presses
+# Ambition, in twelve presses
 
-Ambition turns any text file into a conversation with an agent. There is no
-chat box. You write a line, you press a key on it, and the answer appears
-in the file, or the file itself changes. Behind it is a T3 Code thread for
+Ambition turns any text file, or any text field on a Mac, into a
+conversation with an agent. There is no chat box. You press a key on a
+line, and the answer appears there, or the text itself changes. Behind it is a T3 Code thread for
 this file, with a full toolkit (shell, web, git, other agents).
 
 How to play:
@@ -13,19 +13,22 @@ How to play:
 - Each step has a line that starts with ^. Put the cursor on it and press
   the key (⌃⌥↩ in the bindings Ambition ships). One step per press.
 - Saving does nothing, and neither does typing: only a press sends a line,
-  and only the line under the cursor.
+  and only the line under the cursor. Ambition never saves your file
+  either: with your editor's Ambition extension, the answer goes into the
+  open buffer, unsaved, and your editor's undo takes it back.
 - The first press in a folder asks whether Ambition may work there. Allow
   once lets this press through; Always lets every press in that folder
   through from now on.
 
-## 1 · Three marks
+## 1 · A press, and three marks
 
-    ^ a prompt         asks the agent, about the text around it
+    any line           a request: the agent does what the text needs
+    ^ a prompt         says what to look at, and what to do
     ^/help             a command: runs at once, no AI involved
     ^> an answer       the agent's reply; your next press in this file clears it
 
 That is all the syntax there is. (The lines just above are indented, so
-they are only examples: a press on them sends nothing.)
+they are only examples of the marks.)
 
 ## 2 · An instant command
 
@@ -42,6 +45,15 @@ The quick brown fox jumps over the lazy dog, who has seen this sentence so
 many times that it no longer bothers to move.
 
 ^ rewrite this paragraph as a two-line poem
+
+## 3½ · No mark at all
+
+Press on the sentence below, which has no mark. The agent reads it and the
+lines around it, and does what the text seems to need, with the smallest
+change it can. When it cannot tell what you want, it asks one short `^>`
+question and changes nothing.
+
+Their going to the libary tomorow, if it isnt raining.
 
 ## 4 · Take it back, and talk back
 
@@ -110,6 +122,20 @@ only covers files in this folder, so ask for what you want done. Carets work
 in code files too, after a comment marker: # ^ in Python, // ^ in JavaScript.
 
 ^ write uptime_haiku.py, which turns this computer's uptime into a haiku, then run it and give me its output
+
+## 9½ · Any text field (on a Mac)
+
+With Ambition.app running and allowed in System Settings (the README says
+how), open Notes, or a comment box in your browser, and write:
+
+    ^ turn this into a polite two-line reply: cant make it friday, sorry
+
+Press ⌃⌥↩ on it. The first press in an app asks whether Ambition may work
+there. A status line appears in the field at once, and the answer replaces
+it, highlighted for a moment. Press again before you type, and it shows the
+change again. If you type there, or switch away, while the agent works,
+nothing is written: a notice says so, and a press in the field puts the
+answer in.
 
 ## 10 · Did it remember, and who else is there?
 
